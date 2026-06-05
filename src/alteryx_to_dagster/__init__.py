@@ -7,5 +7,5 @@ Public entry points:
 """
 from .runner import import_workflow
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = ["import_workflow", "__version__"]

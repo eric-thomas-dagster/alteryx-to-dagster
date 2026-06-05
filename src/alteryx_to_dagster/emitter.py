@@ -41,9 +41,13 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "dataframe_join": "DataframeJoin",     # no -Component suffix
     "dataframe_union": "DataframeUnion",   # no -Component suffix
     "dataframe_from_csv": "DataframeFromCsvComponent",
+    "dataframe_from_parquet": "DataframeFromParquetComponent",
+    "dataframe_from_excel": "DataframeFromExcelComponent",
+    "dataframe_from_yxdb": "DataframeFromYxdbComponent",
     "dataframe_to_csv": "DataframeToCsvComponent",
     "dataframe_to_excel": "DataframeToExcelComponent",
     "dataframe_to_parquet": "DataframeToParquetComponent",
+    "sql_transform": "SqlTransformComponent",
 }
 
 

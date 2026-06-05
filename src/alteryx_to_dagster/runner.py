@@ -146,16 +146,19 @@ def import_workflow(
             result.notes,
         ))
 
-    # Surface bundled files (only present when the source was .yxzp / .yxmz) as
-    # "couldn't convert" rows — `.yxdb` is a proprietary binary format and
-    # macros need separate parsing.
+    # Surface bundled files (only present when the source was .yxzp / .yxmz).
+    # We can now NATIVELY read .yxdb — point at `dataframe_from_yxdb` instead
+    # of telling people to manually convert.
     for yxdb in wf.bundled_data_files:
         unmapped_results.append((
             "(bundled)",
             "yxdb data file",
             f"Bundled .yxdb data file in the .yxzp/.yxmz package: `{yxdb}`",
-            "Convert the .yxdb to CSV / Parquet manually (open in Alteryx, "
-            "Output Data tool → CSV) then reference it from a `dataframe_from_csv` asset.",
+            "Read natively via the `dataframe_from_yxdb` registry component, "
+            "or convert to Parquet for portability: "
+            "`python -c \"import import_yxdb; import_yxdb.to_dataframe('%s').to_parquet('%s.parquet')\"`. "
+            "Cloud-deployable: copy the file (or its parquet equivalent) into "
+            "S3 / GCS / ADLS and update `file_path` in the emitted defs.yaml." % (yxdb, yxdb),
         ))
     for yxmc in wf.bundled_macros:
         unmapped_results.append((
@@ -165,6 +168,11 @@ def import_workflow(
             "Macros are nested workflows. Either inline the macro's logic as additional "
             "assets here, or re-import the .yxmc separately with `alteryx-import`.",
         ))
+
+    # Cloud-portability warning: scan emitted defs for absolute local paths
+    # so customers don't deploy a project that breaks the moment it leaves
+    # the developer's laptop.
+    _emit_local_path_warning(mapped_results, files_written, out_dir)
 
     report = emit_migration_report(
         out_dir,
@@ -181,3 +189,67 @@ def import_workflow(
         "migration_report": report,
         "files_written": files_written,
     }
+
+
+# --------------------------------------------------------------- helpers
+
+_LOCAL_PATH_RE = __import__("re").compile(
+    r"""(?:^|['"= ])([A-Z]:[\\/][^'"\n]+|/[A-Za-z0-9_./-]+|~/[^'"\n]+)""",
+    __import__("re").MULTILINE,
+)
+
+
+def _emit_local_path_warning(mapped_results, files_written, out_dir: Path) -> None:
+    """Scan emitted defs.yaml + .py files for absolute local paths. If any,
+    inject a single CLOUD_PORTABILITY.md alongside MIGRATION.md explaining
+    that local paths won't survive a Dagster Cloud / k8s deployment and
+    recommending S3 / GCS / ADLS / Snowflake-stage equivalents.
+
+    Doesn't modify the emitted YAML — that's a human judgment call (which
+    cloud, which bucket layout, which credentials). Just surfaces the gap.
+    """
+    found_paths: List[str] = []
+    for p in files_written:
+        if not p.exists() or p.name.endswith((".md",)):
+            continue
+        try:
+            text = p.read_text()
+        except OSError:
+            continue
+        for m in _LOCAL_PATH_RE.finditer(text):
+            path = m.group(1)
+            # Filter out things that are obviously not data-file paths
+            # (e.g. `/tmp` chunks of regex, dotted Python imports).
+            if path.startswith(("/usr", "/etc", "/var/log")):
+                continue
+            if "." not in path.rsplit("/", 1)[-1]:  # no extension → unlikely a file
+                continue
+            found_paths.append(f"  {p.relative_to(out_dir)}: {path}")
+
+    if not found_paths:
+        return
+
+    md = out_dir / "CLOUD_PORTABILITY.md"
+    body = (
+        "# Cloud-portability notice\n\n"
+        "The imported project references **local filesystem paths** in one or "
+        "more emitted assets. Local paths work for `dg dev` on your laptop, "
+        "but break the moment the project deploys anywhere else — Dagster+ "
+        "Hybrid / Serverless, Kubernetes, a CI runner — because none of those "
+        "environments share your laptop's filesystem.\n\n"
+        "**Recommended fix**: copy the referenced files (or their converted "
+        "equivalents — Parquet is usually the right swap for .yxdb / .csv) into "
+        "cloud object storage and update `file_path` in each defs.yaml:\n\n"
+        "| Cloud | URL shape |\n"
+        "|---|---|\n"
+        "| AWS S3 | `s3://my-bucket/alteryx-exports/customers.parquet` |\n"
+        "| Google Cloud Storage | `gs://my-bucket/alteryx-exports/customers.parquet` |\n"
+        "| Azure Blob | `abfs://container@account.dfs.core.windows.net/path/file.parquet` |\n"
+        "| Snowflake stage | `@MY_STAGE/path/customers.parquet` (via `sql_transform`) |\n\n"
+        "Most `dataframe_from_*` components accept the same URL forms pandas "
+        "/ pyarrow do, so the swap is usually one line per asset.\n\n"
+        "## Local paths detected in this import\n\n"
+    )
+    body += "\n".join(sorted(set(found_paths))) + "\n"
+    md.write_text(body)
+    files_written.append(md)

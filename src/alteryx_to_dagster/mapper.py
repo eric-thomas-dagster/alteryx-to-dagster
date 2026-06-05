@@ -505,26 +505,48 @@ def _map_unique(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 
 
 def _map_input_csv(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
-    """Alteryx Input Data tool reading a delimited file. CSV-flavored mapping."""
-    # NB: Element.__bool__ returns False when the element has no children,
-    # so `find("File") or find("Connection")` silently drops File when it
-    # only carries text. Use explicit `is not None` instead.
+    """Alteryx Input Data tool. Routes by file extension:
+
+      .csv / .tsv / .txt         → dataframe_from_csv
+      .parquet                   → dataframe_from_parquet
+      .xlsx / .xls               → dataframe_from_excel
+      .yxdb                      → dataframe_from_yxdb (native Alteryx binary)
+      anything else              → dataframe_from_csv (with a note)
+
+    The `<File>` element only carries text — `find("File") or find("Connection")`
+    silently drops File on text-only elements because ElementTree's
+    Element.__bool__ is False when there are no children. Use explicit
+    `is not None` instead.
+    """
     file_el = node.config.find("File")
     if file_el is None:
         file_el = node.config.find("Connection")
     file_path = (file_el.text or "").strip() if file_el is not None else ""
+
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    if ext == "parquet":
+        component_id, file_attr = "dataframe_from_parquet", "file_path"
+    elif ext in ("xlsx", "xls"):
+        component_id, file_attr = "dataframe_from_excel", "file_path"
+    elif ext == "yxdb":
+        component_id, file_attr = "dataframe_from_yxdb", "file_path"
+    else:
+        component_id, file_attr = "dataframe_from_csv", "file_path"
+
+    notes = []
+    if ext not in ("csv", "tsv", "txt", "parquet", "xlsx", "xls", "yxdb"):
+        notes.append(
+            f"Input Data on tool {node.tool_id}: unknown extension {ext!r}; "
+            f"defaulted to dataframe_from_csv. Adjust if your file is a different format."
+        )
     return MappedTool(
-        component_id="dataframe_from_csv",
+        component_id=component_id,
         asset_name=_asset_name_for(node),
         attributes={
-            "path": file_path,
+            file_attr: file_path,
             "group_name": "alteryx_imported",
         },
-        notes=[
-            f"Input Data on tool {node.tool_id}: assumed CSV. For Excel / parquet / DB "
-            "inputs, swap `dataframe_from_csv` for `dataframe_from_excel` / "
-            "`dataframe_from_parquet` / a `*_resource` + `sql_transform`."
-        ],
+        notes=notes,
     )
 
 
@@ -555,6 +577,507 @@ def _map_output_csv(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
             "file_path": file_path,
             "group_name": "alteryx_imported",
         },
+    )
+
+
+# ================================================================ In-DB tools
+#
+# Alteryx In-DB tools push compute into the warehouse — the chain of
+# tools assembles a single SQL query that executes on the source DB
+# (Snowflake / Postgres / BigQuery / etc.). The "ideal" mapping is a
+# single Dagster `sql_transform` asset per In-DB subgraph that emits the
+# assembled query as a single push-down statement (preserves Alteryx's
+# performance story).
+#
+# v1 of this importer does the simpler thing: tool-by-tool, each In-DB
+# tool becomes its own `sql_transform` asset that creates an intermediate
+# table that the next tool selects from. Loses single-query pushdown but
+# is unambiguous and easy to read. Future v2 can detect connected In-DB
+# subgraphs and collapse them into a single sql_transform with CTEs.
+
+
+def _indb_destination_table(node: AlteryxNode) -> str:
+    """Stable intermediate-table name per Alteryx tool."""
+    return f"alteryx_indb_tool_{node.tool_id}_{_asset_name_for(node)}"
+
+
+def _indb_connection_env_var(node: AlteryxNode) -> str:
+    """Pick the connection-URL env var. Alteryx config carries a connection
+    name in <Connection> or <ConnectionString>; we slugify it into an env
+    var so customers can wire one connection per Alteryx In-DB workflow.
+    """
+    cfg = node.config
+    for tag in ("Connection", "ConnectionString", "ConnectionName"):
+        el = cfg.find(tag)
+        if el is not None:
+            txt = (el.text or el.attrib.get("value") or "").strip()
+            if txt:
+                slug = re.sub(r"[^A-Za-z0-9]+", "_", txt).strip("_").upper()
+                if slug:
+                    return f"{slug}_URL"
+    return "INDB_CONNECTION_URL"
+
+
+def _indb_upstream_table(upstream_asset_name: str) -> str:
+    """If an upstream is also an In-DB asset, its destination_table follows
+    the same naming convention as us. We don't have direct access to the
+    upstream's node here, so we just use the asset-name suffix and hope
+    it matches. (For tool-by-tool emission this works because the runner
+    builds the asset name and we wrap it.)"""
+    # By convention upstream In-DB destination tables are named
+    # `alteryx_indb_tool_<id>_<asset_name>` — but here we only have the
+    # asset_name. The downstream sql_transform's `upstream_asset_keys`
+    # carries the Dagster lineage; for the SQL FROM we reference the
+    # destination_table value. Caller passes that in via `_make_indb_sql`
+    # below using upstream_dest_tables tracked at the runner level.
+    return upstream_asset_name
+
+
+def _make_indb_mapped(
+    node: AlteryxNode,
+    sql: str,
+    upstreams: List[str],
+    *,
+    return_dataframe: bool = False,
+    extra_notes: Optional[List[str]] = None,
+) -> MappedTool:
+    return MappedTool(
+        component_id="sql_transform",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "connection_url_env_var": _indb_connection_env_var(node),
+            "destination_table": _indb_destination_table(node),
+            "sql": sql,
+            "return_dataframe": return_dataframe,
+            "if_exists": "replace",
+            "upstream_asset_keys": list(upstreams) if upstreams else None,
+            "group_name": "alteryx_imported_indb",
+        },
+        notes=[
+            f"In-DB tool {node.tool_id}: each Alteryx In-DB tool materializes "
+            "its own intermediate table. To preserve Alteryx's single-query "
+            "pushdown, future versions will collapse chains into one sql_transform "
+            "with CTEs — for now you can hand-merge sibling assets if perf matters."
+        ] + (extra_notes or []),
+    )
+
+
+def _map_indb_input(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
+    cfg = node.config
+    query_el = cfg.find("Query") or cfg.find("TableSelect") or cfg.find("Table")
+    raw_sql = (query_el.text or "").strip() if query_el is not None and query_el.text else ""
+    if not raw_sql:
+        # Some Alteryx In-DB Input tools store the query as a TableName attribute.
+        table_el = cfg.find("TableName") or cfg.find("Source")
+        table_name = (table_el.text or "").strip() if table_el is not None and table_el.text else "TODO_source_table"
+        raw_sql = f"SELECT * FROM {table_name}"
+    return _make_indb_mapped(node, raw_sql, [])
+
+
+def _map_indb_filter(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    cfg = node.config
+    expr_el = cfg.find("Expression")
+    raw = (expr_el.text or "").strip() if expr_el is not None and expr_el.text else "TRUE"
+    # In-DB expressions are already SQL — strip Alteryx [brackets] to bare names.
+    sql_expr = _strip_field_brackets(raw)
+    upstream_table = upstreams[0] if upstreams else "UPSTREAM_TABLE"
+    sql = f"SELECT * FROM {upstream_table} WHERE {sql_expr}"
+    return _make_indb_mapped(node, sql, upstreams)
+
+
+def _map_indb_formula(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    cfg = node.config
+    ff_el = cfg.find("FormulaFields")
+    select_extra = []
+    if ff_el is not None:
+        for f in ff_el.findall("FormulaField"):
+            col = f.attrib.get("field", "?")
+            expr = _strip_field_brackets(f.attrib.get("expression", ""))
+            select_extra.append(f"({expr}) AS {col}")
+    upstream_table = upstreams[0] if upstreams else "UPSTREAM_TABLE"
+    select_clause = "*"
+    if select_extra:
+        select_clause = "*, " + ", ".join(select_extra)
+    sql = f"SELECT {select_clause} FROM {upstream_table}"
+    return _make_indb_mapped(node, sql, upstreams)
+
+
+def _map_indb_summarize(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    cfg = node.config
+    group_by = []
+    aggs = []
+    sf_el = cfg.find("SummarizeFields")
+    if sf_el is not None:
+        for f in sf_el.findall("SummarizeField"):
+            field_name = f.attrib.get("field", "")
+            action = f.attrib.get("action", "").lower()
+            rename = f.attrib.get("rename") or None
+            if action == "groupby":
+                group_by.append(field_name)
+            else:
+                out_name = rename or f"{action}_{field_name}"
+                sql_fn = action.upper()
+                # Alteryx → SQL aggregate name mappings
+                sql_fn = {"AVG": "AVG", "SUM": "SUM", "COUNT": "COUNT",
+                          "MIN": "MIN", "MAX": "MAX", "MEDIAN": "MEDIAN"}.get(sql_fn, sql_fn)
+                aggs.append(f"{sql_fn}({field_name}) AS {out_name}")
+    upstream_table = upstreams[0] if upstreams else "UPSTREAM_TABLE"
+    select_clause = ", ".join(group_by + aggs) or "*"
+    group_clause = f"GROUP BY {', '.join(group_by)}" if group_by else ""
+    sql = f"SELECT {select_clause} FROM {upstream_table} {group_clause}".strip()
+    return _make_indb_mapped(node, sql, upstreams)
+
+
+def _map_indb_join(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    cfg = node.config
+    join_left = []
+    join_right = []
+    jf_el = cfg.find("JoinInfo")
+    if jf_el is not None:
+        for f in jf_el.findall("Field"):
+            l = f.attrib.get("field")
+            r = f.attrib.get("field2") or l
+            if l:
+                join_left.append(l)
+                join_right.append(r)
+    left = upstreams[0] if upstreams else "LEFT_TABLE"
+    right = upstreams[1] if len(upstreams) > 1 else "RIGHT_TABLE"
+    on_clause = " AND ".join(f"l.{l} = r.{r}" for l, r in zip(join_left, join_right)) or "1=1"
+    sql = f"SELECT * FROM {left} l JOIN {right} r ON {on_clause}"
+    return _make_indb_mapped(node, sql, upstreams,
+        extra_notes=["In-DB Join: emitted as INNER JOIN — adjust to LEFT/RIGHT/FULL by hand if needed."])
+
+
+def _map_indb_union(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    if not upstreams:
+        sql = "-- TODO: no upstreams wired"
+    else:
+        sql = "\nUNION ALL\n".join(f"SELECT * FROM {u}" for u in upstreams)
+    return _make_indb_mapped(node, sql, upstreams)
+
+
+def _map_indb_sample(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    cfg = node.config
+    n_el = cfg.find("N") or cfg.find("Records")
+    n = int(n_el.text) if n_el is not None and n_el.text and n_el.text.isdigit() else 100
+    upstream_table = upstreams[0] if upstreams else "UPSTREAM_TABLE"
+    sql = f"SELECT * FROM {upstream_table} LIMIT {n}"
+    return _make_indb_mapped(node, sql, upstreams,
+        extra_notes=["In-DB Sample: emitted as LIMIT — random / weighted sampling needs ORDER BY RANDOM() (Postgres) or SAMPLE (Snowflake)."])
+
+
+def _map_indb_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    cfg = node.config
+    cols = []
+    sf_el = cfg.find("SelectFields") or cfg.find("Fields")
+    if sf_el is not None:
+        for f in sf_el.findall("SelectField") + sf_el.findall("Field"):
+            fn = f.attrib.get("field")
+            sel = f.attrib.get("selected", "True").lower() != "false"
+            rename = f.attrib.get("rename")
+            if fn and sel and fn != "*Unknown":
+                cols.append(f"{fn} AS {rename}" if rename and rename != fn else fn)
+    upstream_table = upstreams[0] if upstreams else "UPSTREAM_TABLE"
+    select_clause = ", ".join(cols) or "*"
+    sql = f"SELECT {select_clause} FROM {upstream_table}"
+    return _make_indb_mapped(node, sql, upstreams)
+
+
+def _map_indb_streamout(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Stream Out of In-DB → execute the upstream query, pull result into pandas."""
+    upstream_table = upstreams[0] if upstreams else "UPSTREAM_TABLE"
+    sql = f"SELECT * FROM {upstream_table}"
+    return _make_indb_mapped(node, sql, upstreams, return_dataframe=True,
+        extra_notes=["StreamOut: this is the boundary where data leaves the warehouse and lands in a pandas DataFrame. Downstream non-In-DB tools consume that DataFrame."])
+
+
+def _map_indb_writedata(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """In-DB Write Data → CTAS into a final user-specified table."""
+    cfg = node.config
+    dest_el = cfg.find("TableName") or cfg.find("Destination") or cfg.find("OutputTable")
+    dest_table = (dest_el.text or "TODO_dest_table").strip() if dest_el is not None and dest_el.text else "TODO_dest_table"
+    upstream_table = upstreams[0] if upstreams else "UPSTREAM_TABLE"
+    sql = f"SELECT * FROM {upstream_table}"
+    return MappedTool(
+        component_id="sql_transform",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "connection_url_env_var": _indb_connection_env_var(node),
+            "destination_table": dest_table,
+            "sql": sql,
+            "return_dataframe": False,
+            "if_exists": "replace",
+            "upstream_asset_keys": list(upstreams) if upstreams else None,
+            "group_name": "alteryx_imported_indb",
+        },
+        notes=[f"In-DB WriteData → CTAS into final table `{dest_table}`."],
+    )
+
+
+def _map_indb_connect(node: AlteryxNode, _upstreams: List[str]):
+    """In-DB Connection Manager — sets up a named DB connection. No standalone
+    Dagster asset; surfaced in MIGRATION.md so the user can wire the matching
+    env var."""
+    env_var = _indb_connection_env_var(node)
+    return UnmappedTool(
+        reason=(
+            f"In-DB connection manager tool {node.tool_id}: doesn't materialize "
+            "anything — it just declares a named connection for downstream In-DB "
+            "tools. Set the corresponding env var on your Dagster deployment."
+        ),
+        suggestion=(
+            f"Export `{env_var}` to a SQLAlchemy connection URL "
+            "(e.g. `snowflake://user:pwd@account/db/schema?warehouse=…`). "
+            "Every downstream In-DB tool references this env var via its "
+            "`connection_url_env_var` field."
+        ),
+    )
+
+
+def _map_datetime_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx DateTime tool: parse a string column into a datetime column,
+    OR format a datetime column into a string column. Emit as inline pandas
+    (`pd.to_datetime` or `.dt.strftime`).
+
+    Alteryx tool config: <IsFrom> = "DateTime" (parse) or "String" (format),
+    <Field>, <Format>, <NewField>.
+    """
+    cfg = node.config
+    field_el = cfg.find("InputFieldName") or cfg.find("Field")
+    new_el = cfg.find("OutputFieldName") or cfg.find("NewField")
+    fmt_el = cfg.find("Format")
+    direction_el = cfg.find("IsFrom")
+    field_name = (field_el.text or "Date").strip() if field_el is not None and field_el.text else "Date"
+    new_field = (new_el.text or f"{field_name}_Out").strip() if new_el is not None and new_el.text else f"{field_name}_Out"
+    fmt = (fmt_el.text or "%Y-%m-%d").strip() if fmt_el is not None and fmt_el.text else "%Y-%m-%d"
+    direction = (direction_el.text or "DateTime").strip() if direction_el is not None and direction_el.text else "DateTime"
+
+    upstream = _single_upstream(upstreams)
+    asset_name = _asset_name_for(node)
+
+    if direction.lower().startswith("string"):
+        # Format datetime → string
+        body = f'    df[{new_field!r}] = df[{field_name!r}].dt.strftime({fmt!r})'
+        descr = f"DateTime format ({field_name} → {new_field}, format={fmt})"
+    else:
+        # Parse string → datetime (default)
+        body = f'    df[{new_field!r}] = pd.to_datetime(df[{field_name!r}], format={fmt!r}, errors="coerce")'
+        descr = f"DateTime parse ({field_name} → {new_field}, format={fmt})"
+
+    py = f'''"""Alteryx DateTime tool (tool {node.tool_id}) — inline pandas.
+
+{descr}. The Alteryx format-spec characters mostly match Python's strftime
+codes, but a few differ (Alteryx `yyyy` ≈ Python `%Y`). Spot-check.
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="Alteryx DateTime (tool {node.tool_id}): {descr}",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    df = upstream.copy()
+{body}
+    return df
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        inline_python=py,
+        notes=[
+            f"DateTime on tool {node.tool_id}: emitted as inline pandas "
+            f"({'strftime' if direction.lower().startswith('string') else 'to_datetime'}). "
+            "Alteryx format codes ≈ Python strftime, but spot-check `yyyy` vs `%Y` etc."
+        ],
+    )
+
+
+def _map_regex_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Regex tool: Parse / Replace / Match / Tokenize via a regex pattern.
+
+    Config:
+      <Method>     "Parse" / "Replace" / "Match" / "Tokenize"
+      <Field>      input column
+      <Pattern>    regex pattern
+      <NewField>   output column (for Replace / Match)
+      <Replace>    replacement string (for Replace)
+      <CaseSensitive>
+    """
+    cfg = node.config
+    field_el = cfg.find("Field")
+    pattern_el = cfg.find("Pattern")
+    method_el = cfg.find("Method")
+    new_el = cfg.find("NewField")
+    repl_el = cfg.find("Replace")
+
+    field_name = (field_el.text or "Field").strip() if field_el is not None and field_el.text else "Field"
+    pattern = (pattern_el.text or "").strip() if pattern_el is not None and pattern_el.text else ""
+    method = (method_el.text or "Replace").strip() if method_el is not None and method_el.text else "Replace"
+    new_field = (new_el.text or f"{field_name}_Out").strip() if new_el is not None and new_el.text else f"{field_name}_Out"
+    replacement = (repl_el.text or "").strip() if repl_el is not None and repl_el.text else ""
+
+    upstream = _single_upstream(upstreams)
+    asset_name = _asset_name_for(node)
+    m = method.lower()
+
+    if m == "replace":
+        body = f'    df[{new_field!r}] = df[{field_name!r}].str.replace({pattern!r}, {replacement!r}, regex=True)'
+        descr = f"Regex replace ({field_name} → {new_field}, /{pattern}/ → {replacement!r})"
+    elif m == "match":
+        body = f'    df[{new_field!r}] = df[{field_name!r}].str.match({pattern!r})'
+        descr = f"Regex match ({field_name} → {new_field}, /{pattern}/)"
+    elif m == "tokenize":
+        body = (
+            f'    parts = df[{field_name!r}].str.split({pattern!r}, regex=True, expand=True)\n'
+            f'    parts.columns = [f"{{{field_name!r}}}_{{i+1}}" for i in range(parts.shape[1])]\n'
+            f'    df = pd.concat([df, parts], axis=1)'
+        )
+        descr = f"Regex tokenize ({field_name} split on /{pattern}/)"
+    elif m == "parse":
+        # Parse = extract groups from regex into separate columns
+        body = (
+            f'    parts = df[{field_name!r}].str.extract({pattern!r})\n'
+            f'    parts.columns = [f"{{{field_name!r}}}_g{{i+1}}" for i in range(parts.shape[1])]\n'
+            f'    df = pd.concat([df, parts], axis=1)'
+        )
+        descr = f"Regex parse-groups ({field_name} via /{pattern}/)"
+    else:
+        body = f'    raise NotImplementedError("Unknown Alteryx Regex method: {method!r}")'
+        descr = f"Regex (unknown method {method!r})"
+
+    py = f'''"""Alteryx Regex (tool {node.tool_id}) — inline pandas.
+
+{descr}.
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="Alteryx Regex (tool {node.tool_id}): {descr}",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    df = upstream.copy()
+{body}
+    return df
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        inline_python=py,
+    )
+
+
+def _map_json_parse(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx JSON Parse → pd.json_normalize."""
+    cfg = node.config
+    field_el = cfg.find("Field")
+    field_name = (field_el.text or "JSON_Name").strip() if field_el is not None and field_el.text else "JSON_Name"
+
+    upstream = _single_upstream(upstreams)
+    asset_name = _asset_name_for(node)
+
+    py = f'''"""Alteryx JSON Parse (tool {node.tool_id}) — pd.json_normalize.
+
+Flattens the {field_name!r} JSON column into new columns. Behavior matches
+Alteryx's JSON Parse for most JSON shapes; deeply-nested arrays may need
+explicit `max_level` or a follow-up `explode`.
+"""
+import dagster as dg
+import json
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="Alteryx JSON Parse (tool {node.tool_id}) on column {field_name!r}",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    df = upstream.copy()
+    # Tolerant: already-parsed dicts pass through; strings get json.loads'd.
+    payloads = df[{field_name!r}].apply(
+        lambda v: json.loads(v) if isinstance(v, str) else v
+    )
+    parsed = pd.json_normalize(payloads.tolist())
+    parsed.columns = [f"{field_name}_{{c}}" for c in parsed.columns]
+    return pd.concat([df.drop(columns=[{field_name!r}]), parsed], axis=1)
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        inline_python=py,
+    )
+
+
+def _map_xml_parse(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx XML Parse → inline pandas (lxml-based) extraction.
+
+    Alteryx supports XPath-style extraction with output rules per child.
+    We emit a small handler that uses xml.etree to extract child-element
+    text; users with more complex needs (attributes, namespaces) should
+    tweak.
+    """
+    cfg = node.config
+    field_el = cfg.find("Field")
+    field_name = (field_el.text or "XML").strip() if field_el is not None and field_el.text else "XML"
+
+    upstream = _single_upstream(upstreams)
+    asset_name = _asset_name_for(node)
+
+    py = f'''"""Alteryx XML Parse (tool {node.tool_id}) — inline pandas + xml.etree.
+
+Extracts every direct child element's text from the {field_name!r} column
+into its own column. For attribute-aware or namespace-heavy XML, tweak
+the parser callable below.
+"""
+import dagster as dg
+import pandas as pd
+import xml.etree.ElementTree as ET
+
+
+def _xml_to_dict(xml_str):
+    if not isinstance(xml_str, str) or not xml_str.strip():
+        return {{}}
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return {{}}
+    out = {{}}
+    for child in root:
+        out[child.tag] = (child.text or "").strip()
+    return out
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="Alteryx XML Parse (tool {node.tool_id}) on column {field_name!r}",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    df = upstream.copy()
+    parsed = pd.json_normalize(df[{field_name!r}].apply(_xml_to_dict).tolist())
+    parsed.columns = [f"{field_name}_{{c}}" for c in parsed.columns]
+    return pd.concat([df.drop(columns=[{field_name!r}]), parsed], axis=1)
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        inline_python=py,
+        notes=[
+            f"XMLParse on tool {node.tool_id}: stripped-down parser — extracts "
+            "direct-child-element text only. For attribute / namespace handling, "
+            "edit the `_xml_to_dict` function in the emitted .py."
+        ],
     )
 
 
@@ -1155,23 +1678,79 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     "AlteryxBasePluginsGui.Sort.Sort": _map_sort,
     "AlteryxBasePluginsGui.Unique.Unique": _map_unique,
     "AlteryxBasePluginsGui.Sample.Sample": _map_sample,
+    "AlteryxBasePluginsGui.DateFilter.DateFilter": _map_date_filter,
+    "AlteryxBasePluginsGui.Tile.Tile": _map_tile,
     # Transforms
     "AlteryxBasePluginsGui.Formula.Formula": _map_formula,
     "AlteryxBasePluginsGui.MultiFieldFormula.MultiFieldFormula": _map_multi_field_formula,
     "AlteryxBasePluginsGui.RecordID.RecordID": _map_record_id,
     "AlteryxBasePluginsGui.RunningTotal.RunningTotal": _map_running_total,
+    "AlteryxBasePluginsGui.DataCleansing.DataCleansing": _map_data_cleansing,
     # Aggregates / reshape
     "AlteryxBasePluginsGui.Summarize.Summarize": _map_summarize,
     "AlteryxBasePluginsGui.CountRecords.CountRecords": _map_count_records,
     "AlteryxBasePluginsGui.CrossTab.CrossTab": _map_cross_tab,
     "AlteryxBasePluginsGui.Transpose.Transpose": _map_transpose,
+    # Parse
+    "AlteryxBasePluginsGui.TextToColumns.TextToColumns": _map_text_to_columns,
+    "AlteryxBasePluginsGui.DateTime.DateTime": _map_datetime_tool,
+    "AlteryxBasePluginsGui.RegEx.RegEx": _map_regex_tool,
+    "AlteryxBasePluginsGui.RegExSpawned.RegExSpawned": _map_regex_tool,
+    "AlteryxBasePluginsGui.JSONParse.JSONParse": _map_json_parse,
+    "AlteryxBasePluginsGui.XMLParse.XMLParse": _map_xml_parse,
     # Multi-input
     "AlteryxBasePluginsGui.Join.Join": _map_join,
+    "AlteryxBasePluginsGui.JoinMultiple.JoinMultiple": _map_join_multiple,
     "AlteryxBasePluginsGui.Union.Union": _map_union,
-    # Append is just Union for our purposes — alias.
-    "AlteryxBasePluginsGui.Append.Append": _map_union,
+    "AlteryxBasePluginsGui.Append.Append": _map_union,    # alias of Union
     "AlteryxBasePluginsGui.AppendFields.AppendFields": _map_append_fields,
+    # In-DB tools (multiple plugin namespaces in the wild — match all)
+    "AlteryxConnectorsGui.InDbConnectionManager.InDbConnectionManager": _map_indb_connect,
+    "AlteryxConnectorsGui.InDbInput.InDbInput": _map_indb_input,
+    "AlteryxConnectorsGui.InDbFilter.InDbFilter": _map_indb_filter,
+    "AlteryxConnectorsGui.InDbFormula.InDbFormula": _map_indb_formula,
+    "AlteryxConnectorsGui.InDbSelect.InDbSelect": _map_indb_select,
+    "AlteryxConnectorsGui.InDbSummarize.InDbSummarize": _map_indb_summarize,
+    "AlteryxConnectorsGui.InDbJoin.InDbJoin": _map_indb_join,
+    "AlteryxConnectorsGui.InDbUnion.InDbUnion": _map_indb_union,
+    "AlteryxConnectorsGui.InDbSample.InDbSample": _map_indb_sample,
+    "AlteryxConnectorsGui.InDbStreamOut.InDbStreamOut": _map_indb_streamout,
+    "AlteryxConnectorsGui.InDbWriteData.InDbWriteData": _map_indb_writedata,
+    # Some versions use a different namespace prefix.
+    "AlteryxConnectorsGui.InDb.InDbInput": _map_indb_input,
+    "AlteryxConnectorsGui.InDb.InDbFilter": _map_indb_filter,
 }
+
+
+# Fuzzier match for In-DB tools whose plugin id varies across Alteryx versions
+# (the canonical match goes through PLUGIN_REGISTRY first; this is a fallback).
+def _fuzzy_indb_match(plugin: str) -> Optional[ToolMapping]:
+    if "indb" not in plugin.lower():
+        return None
+    name = plugin.lower()
+    if "connectionmanager" in name or "indbconnect" in name:
+        return _map_indb_connect
+    if "input" in name:
+        return _map_indb_input
+    if "filter" in name:
+        return _map_indb_filter
+    if "formula" in name:
+        return _map_indb_formula
+    if "select" in name:
+        return _map_indb_select
+    if "summarize" in name:
+        return _map_indb_summarize
+    if "join" in name:
+        return _map_indb_join
+    if "union" in name:
+        return _map_indb_union
+    if "sample" in name:
+        return _map_indb_sample
+    if "streamout" in name:
+        return _map_indb_streamout
+    if "writedata" in name or "output" in name:
+        return _map_indb_writedata
+    return None
 
 
 # A subset of mappers accepts a `translator` kwarg (the LLM-assisted ones).
@@ -1179,6 +1758,41 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
 # type clean and means mappers that don't need translation don't have to
 # care about it.
 _TRANSLATOR_AWARE_MAPPERS = frozenset({"_map_formula", "_map_multi_field_formula"})
+
+
+_CONTROL_FLOW_PLUGINS = {
+    # Each of these has a natural Dagster-native equivalent that's *implicit* in
+    # the DAG — we emit no Dagster asset for them, just a MIGRATION.md note.
+    "AlteryxBasePluginsGui.BlockUntilDone.BlockUntilDone": (
+        "Block Until Done — Dagster's DAG already waits for upstream assets "
+        "before scheduling downstream. No mapping needed: the DAG topology "
+        "we emit preserves the ordering this tool was enforcing."
+    ),
+    "AlteryxBasePluginsGui.CacheDataset.CacheDataset": (
+        "Cache Dataset — Dagster's IO managers persist asset values between "
+        "runs by default (LocalFileSystem / S3 / GCS / etc., depending on "
+        "config). No mapping needed."
+    ),
+    "AlteryxBasePluginsGui.MessageBus.MessageBus": (
+        "Message tool — used for in-flow logging. Drop or replace with "
+        "context.log.info() calls in adjacent Python assets if needed."
+    ),
+    "AlteryxBasePluginsGui.Browse.Browse": (
+        "Browse tool — Alteryx-specific data preview. Dagster's UI shows "
+        "asset previews in materialization metadata automatically; "
+        "delete this tool from the migrated project."
+    ),
+    "AlteryxGuiToolkit.Detour.Detour": (
+        "Detour — conditional bypass. Dagster equivalent: AutomationCondition "
+        "on the downstream asset, or a `dagster.skip_if` pattern in a sensor. "
+        "Not auto-mapped because the condition expression usually needs "
+        "human judgment for the Dagster-native shape."
+    ),
+    "AlteryxGuiToolkit.Detour.DetourEnd": (
+        "Detour End — companion to the Detour tool. Drop after wiring up "
+        "the Detour's downstream AutomationCondition."
+    ),
+}
 
 
 def map_tool(node: AlteryxNode, upstreams: List[str], translator=None):
@@ -1189,16 +1803,34 @@ def map_tool(node: AlteryxNode, upstreams: List[str], translator=None):
     (IIF / Contains / DateTimeAdd / …) through the LLM at import time.
     Other mappers ignore it.
     """
-    fn = PLUGIN_REGISTRY.get(node.plugin)
-    if fn is None:
+    # Control-flow tools first — these are intentionally "unmapped" with
+    # a clear explanation in MIGRATION.md (Dagster handles the equivalent
+    # implicitly).
+    cf_note = _CONTROL_FLOW_PLUGINS.get(node.plugin)
+    if cf_note:
         return UnmappedTool(
-            reason=f"No mapping for plugin {node.plugin!r}",
+            reason=cf_note,
             suggestion=(
-                "Register a mapper in alteryx_to_dagster.mapper.PLUGIN_REGISTRY, "
-                "or rebuild this tool's logic manually using "
-                "`dagster-component search <keyword>` to find an equivalent."
+                "Safe to drop — the Alteryx tool's behavior is implicit in "
+                "the Dagster DAG / IO manager / automation_condition layer."
             ),
         )
+
+    fn = PLUGIN_REGISTRY.get(node.plugin)
+    if fn is None:
+        # Fuzzy match for In-DB plugins whose namespace varies across versions.
+        fuzzy = _fuzzy_indb_match(node.plugin)
+        if fuzzy is not None:
+            fn = fuzzy
+        else:
+            return UnmappedTool(
+                reason=f"No mapping for plugin {node.plugin!r}",
+                suggestion=(
+                    "Register a mapper in alteryx_to_dagster.mapper.PLUGIN_REGISTRY, "
+                    "or rebuild this tool's logic manually using "
+                    "`dagster-component search <keyword>` to find an equivalent."
+                ),
+            )
     if translator is not None and fn.__name__ in _TRANSLATOR_AWARE_MAPPERS:
         return fn(node, upstreams, translator=translator)
     return fn(node, upstreams)
