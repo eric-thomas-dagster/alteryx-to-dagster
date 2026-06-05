@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+from .expr_translator import ExprTranslation, translate as _det_translate
 from .parser import AlteryxNode
 
 
@@ -41,26 +42,14 @@ def _strip_field_brackets(expr: str) -> str:
     return _BRACKETED_FIELD.sub(r"\1", expr)
 
 
-def _translate_simple_expr(expr: str) -> tuple[str, bool]:
-    """Best-effort Alteryx expression → pandas eval. Returns (expr, fully_translated).
+def _translate_expr(expr: str) -> ExprTranslation:
+    """Run the deterministic translator. Returns an ExprTranslation; callers
+    decide what to do with `is_python` / `fully` (route through eval, PYTHON
+    path, or fall back to LLM).
 
-    Handles:
-      - [Field] → Field (bracket stripping)
-      - Simple arithmetic / comparison passthrough
-    Flags as not-fully-translated when we see Alteryx-only constructs (IIF,
-    Contains, DateTimeAdd, Switch, etc.) — those become TODOs the user (or
-    the v1.5 LLM step) resolves.
+    Thin wrapper kept here so the mapper has one canonical entry point.
     """
-    stripped = _strip_field_brackets(expr).strip()
-    # Detect Alteryx-specific function calls that pandas eval can't handle.
-    alteryx_only = re.compile(
-        r"\b(IIF|Switch|Contains|StartsWith|EndsWith|DateTimeAdd|DateTimeDiff|"
-        r"DateTimeFormat|DateTimeParse|Substring|Regex|Length|Trim|UpperCase|LowerCase|"
-        r"ToString|ToNumber|Null|IsNull|IsEmpty|FindString|PadLeft|PadRight)\s*\(",
-        re.IGNORECASE,
-    )
-    fully = alteryx_only.search(stripped) is None
-    return stripped, fully
+    return _det_translate(expr)
 
 
 def _ascii_safe(s: str) -> str:
@@ -167,25 +156,70 @@ def {name}() -> pd.DataFrame:
 
 
 def _map_filter(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Filter → `filter` component. The `filter` component takes
+    a pandas-eval string for `condition`. If our deterministic translator
+    has to fall back to a PYTHON-path Series expression (because the filter
+    uses `Contains`, `DateTimeAdd`, etc.), we can't use `filter` directly —
+    emit an inline @dg.asset .py that does `df.loc[…]` instead. Same
+    runtime-deterministic story as the formula PYTHON path."""
     expr_el = node.config.find("Expression")
     raw_expr = (expr_el.text or "").strip() if expr_el is not None else ""
-    translated, fully = _translate_simple_expr(raw_expr)
-    notes = []
-    if not fully:
+    upstream = _single_upstream(upstreams)
+    asset_name = _asset_name_for(node)
+
+    tr = _translate_expr(raw_expr)
+    notes = list(tr.notes)
+
+    if not tr.fully:
         notes.append(
-            f"Filter expression on tool {node.tool_id} contains Alteryx-only "
-            f"functions: `{raw_expr}` → translated as `{translated}`. "
-            "Review and adjust to pandas eval (or wait for v1.5 LLM-assisted translation)."
+            f"Filter expression on tool {node.tool_id}: at least one Alteryx-only "
+            f"function couldn't be deterministically translated. Original: `{raw_expr}`. "
+            f"Best-effort emitted: `{tr.pandas_expr}`. Review by hand or re-run with "
+            f"`--llm-translate <model>`."
         )
+
+    if not tr.is_python:
+        # Pandas-eval-compatible filter — happy path.
+        return MappedTool(
+            component_id="filter",
+            asset_name=asset_name,
+            attributes={
+                "upstream_asset_key": upstream,
+                "condition": tr.pandas_expr,
+                "group_name": "alteryx_imported",
+            },
+            notes=notes,
+        )
+
+    # PYTHON path — emit inline .py using df.loc[<mask>].
+    py = f'''"""Alteryx Filter (tool {node.tool_id}) — emitted as inline Python.
+
+The original Alteryx filter used a function pandas.eval can't compile
+(Contains / DateTimeAdd / IIF / etc.), so we emit a small @dg.asset
+that uses df.loc[<mask>] instead. Fully deterministic at runtime.
+
+Original Alteryx expression: {raw_expr}
+"""
+import dagster as dg
+import numpy as np  # noqa: F401
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="Alteryx Filter (tool {node.tool_id}) — inline pandas .loc mask.",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    df = upstream
+    return df.loc[{tr.pandas_expr}].copy()
+'''
     return MappedTool(
-        component_id="filter",
-        asset_name=_asset_name_for(node),
-        attributes={
-            "upstream_asset_key": _single_upstream(upstreams),
-            "condition": translated,           # `filter` component calls it `condition`, not `filter_expression`
-            "group_name": "alteryx_imported",
-        },
+        component_id="(inline_python)",
+        asset_name=asset_name,
         notes=notes,
+        inline_python=py,
     )
 
 
@@ -220,10 +254,15 @@ def _map_formula(node: AlteryxNode, upstreams: List[str], translator=None) -> Ma
         for f in ff_el.findall("FormulaField"):
             out_field = f.attrib.get("field", "?")
             expr = f.attrib.get("expression", "")
-            translated, fully = _translate_simple_expr(expr)
+            tr = _translate_expr(expr)
+            notes.extend(tr.notes)
 
-            if fully:
-                expressions[out_field] = translated
+            if tr.fully:
+                # Deterministic translation succeeded — no LLM needed.
+                if tr.is_python:
+                    python_exprs[out_field] = tr.pandas_expr
+                else:
+                    expressions[out_field] = tr.pandas_expr
                 continue
 
             if translator is None:
@@ -519,6 +558,279 @@ def _map_output_csv(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     )
 
 
+def _map_text_to_columns(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Text To Columns → inline pandas `.str.split()` expansion.
+
+    No 1:1 registry component; emit as a small @dg.asset .py so the
+    expansion stays deterministic.
+    """
+    field_el = node.config.find("Field")
+    delim_el = node.config.find("Delimeters") or node.config.find("Delimiters")
+    cols_el = node.config.find("NumFields") or node.config.find("NumColumns")
+    asset_name = _asset_name_for(node)
+    upstream = _single_upstream(upstreams)
+    field_name = (field_el.text or "Field1").strip() if field_el is not None else "Field1"
+    delim = (delim_el.text or ",").strip() if delim_el is not None else ","
+    n_cols = int(cols_el.text) if cols_el is not None and cols_el.text and cols_el.text.isdigit() else None
+
+    n_cols_arg = f"n={n_cols - 1}" if n_cols else ""
+    py = f'''"""Alteryx Text To Columns (tool {node.tool_id}) — inline pandas split.
+
+Splits the {field_name!r} column on delimiter {delim!r} into N columns.
+No 1:1 registry component for this shape; emitted as inline Python so
+runtime stays deterministic.
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="Alteryx Text To Columns (tool {node.tool_id})",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    df = upstream.copy()
+    parts = df[{field_name!r}].str.split({delim!r}, expand=True{', ' + n_cols_arg if n_cols_arg else ''})
+    parts.columns = [f"{{ {field_name!r} }}{{i + 1}}" for i in range(parts.shape[1])]
+    return pd.concat([df, parts], axis=1)
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        inline_python=py,
+        notes=[
+            f"TextToColumns on tool {node.tool_id}: column-naming follows "
+            f"Alteryx's {field_name!r}1 / {field_name!r}2 / … convention. "
+            "Adjust if your downstream expects different names."
+        ],
+    )
+
+
+def _map_data_cleansing(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Data Cleansing → inline pandas (strip whitespace + case + null fill).
+
+    Reads the standard config flags (TrimWhitespace, RemoveTabs, ReplaceNullsString,
+    ReplaceNullsNumeric, ChangeCase, etc.) and emits a deterministic .py asset.
+    """
+    cfg = node.config
+    asset_name = _asset_name_for(node)
+    upstream = _single_upstream(upstreams)
+
+    def _flag(name: str) -> bool:
+        el = cfg.find(name)
+        if el is None:
+            return False
+        v = (el.text or "").strip().lower() if el.text else (el.attrib.get("value", "") or "").lower()
+        return v in ("true", "1", "yes")
+
+    trim_ws = _flag("TrimWhitespace")
+    remove_tabs = _flag("RemoveTabs")
+    remove_dupws = _flag("RemoveDuplicateWhitespace")
+    fill_str = _flag("ReplaceNullsString")
+    fill_num = _flag("ReplaceNullsNumeric")
+    case_el = cfg.find("ChangeCase")
+    case_op = (case_el.text or "").strip().lower() if case_el is not None and case_el.text else ""
+
+    steps = []
+    if trim_ws:
+        steps.append('    for c in df.select_dtypes(include="object").columns:\n        df[c] = df[c].str.strip()')
+    if remove_tabs:
+        steps.append('    for c in df.select_dtypes(include="object").columns:\n        df[c] = df[c].str.replace("\\t", "", regex=False)')
+    if remove_dupws:
+        steps.append('    for c in df.select_dtypes(include="object").columns:\n        df[c] = df[c].str.replace(r"\\s+", " ", regex=True)')
+    if fill_str:
+        steps.append('    for c in df.select_dtypes(include="object").columns:\n        df[c] = df[c].fillna("")')
+    if fill_num:
+        steps.append('    for c in df.select_dtypes(include="number").columns:\n        df[c] = df[c].fillna(0)')
+    if case_op == "upper":
+        steps.append('    for c in df.select_dtypes(include="object").columns:\n        df[c] = df[c].str.upper()')
+    elif case_op == "lower":
+        steps.append('    for c in df.select_dtypes(include="object").columns:\n        df[c] = df[c].str.lower()')
+    elif case_op == "title":
+        steps.append('    for c in df.select_dtypes(include="object").columns:\n        df[c] = df[c].str.title()')
+
+    body = "\n".join(steps) if steps else "    pass   # no cleansing flags set on the Alteryx tool"
+
+    py = f'''"""Alteryx Data Cleansing (tool {node.tool_id}) — inline pandas.
+
+Implements the cleansing flags that were enabled on the Alteryx tool —
+trim whitespace, remove tabs/dup whitespace, fill nulls, change case.
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="Alteryx Data Cleansing (tool {node.tool_id})",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    df = upstream.copy()
+{body}
+    return df
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        inline_python=py,
+    )
+
+
+def _map_date_filter(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Date Filter → `filter` with a between-style pandas-eval predicate."""
+    field_el = node.config.find("Field")
+    from_el = node.config.find("FromDate")
+    to_el = node.config.find("ToDate")
+    field_name = (field_el.text or "Date").strip() if field_el is not None else "Date"
+    from_d = (from_el.text or "").strip() if from_el is not None else ""
+    to_d = (to_el.text or "").strip() if to_el is not None else ""
+
+    parts = []
+    if from_d:
+        parts.append(f'{field_name} >= "{from_d}"')
+    if to_d:
+        parts.append(f'{field_name} <= "{to_d}"')
+    condition = " & ".join(f"({p})" for p in parts) or "True"
+    return MappedTool(
+        component_id="filter",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "condition": condition,
+            "group_name": "alteryx_imported",
+        },
+        notes=[
+            f"DateFilter on tool {node.tool_id}: emitted as a `filter` with a "
+            f"between predicate ({condition}). Make sure {field_name!r} is "
+            "datetime-typed upstream — pandas string-vs-date comparison can be a footgun."
+        ],
+    )
+
+
+def _map_join_multiple(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Join Multiple → inline pandas chained .merge() across all upstreams.
+
+    JoinMultiple takes ≥ 2 inputs + a configured join field. We don't have an
+    N-way `dataframe_join`, so emit inline Python that merges them all in order.
+    """
+    cfg = node.config
+    asset_name = _asset_name_for(node)
+    join_field_el = cfg.find("JoinByRecordPosition") or cfg.find("JoinField")
+    join_field = None
+    if join_field_el is not None and join_field_el.text:
+        join_field = join_field_el.text.strip()
+
+    if not upstreams:
+        return MappedTool(
+            component_id="(inline_python)",
+            asset_name=asset_name,
+            inline_python="# no upstreams — this Alteryx JoinMultiple tool wasn't wired up.\n",
+        )
+
+    ins_block = ", ".join(
+        f'"u{i}": dg.AssetIn(key=dg.AssetKey({u!r}))' for i, u in enumerate(upstreams)
+    )
+    args_decl = ", ".join(f"u{i}: pd.DataFrame" for i in range(len(upstreams)))
+    if join_field:
+        merge_chain = f"    df = u0\n    for next_df in [{', '.join(f'u{i}' for i in range(1, len(upstreams)))}]:\n        df = df.merge(next_df, on={join_field!r}, how='inner')"
+    else:
+        merge_chain = (
+            "    # Alteryx default is positional join when no key is set. Recreate via index alignment:\n"
+            "    df = u0.reset_index(drop=True)\n"
+            f"    for next_df in [{', '.join(f'u{i}' for i in range(1, len(upstreams)))}]:\n"
+            "        df = pd.concat([df, next_df.reset_index(drop=True)], axis=1)"
+        )
+
+    py = f'''"""Alteryx Join Multiple (tool {node.tool_id}) — inline pandas chained merge.
+
+No N-way `dataframe_join` in the registry; this asset chains pandas
+.merge() across all upstreams in connection order. Output is deterministic.
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{ {ins_block} }},
+    description="Alteryx Join Multiple (tool {node.tool_id}) — {len(upstreams)} inputs",
+)
+def {asset_name}({args_decl}) -> pd.DataFrame:
+{merge_chain}
+    return df
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        inline_python=py,
+        notes=[
+            f"JoinMultiple on tool {node.tool_id}: chained {len(upstreams)} inputs via pandas .merge(). "
+            "Alteryx supports more advanced match logic (output-only-from-one-side, etc.) — "
+            "this is the default inner-join chain."
+        ],
+    )
+
+
+def _map_tile(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Tile → inline pandas pd.qcut / pd.cut for bucket assignment."""
+    cfg = node.config
+    asset_name = _asset_name_for(node)
+    upstream = _single_upstream(upstreams)
+    method_el = cfg.find("Method")
+    field_el = cfg.find("Field")
+    num_el = cfg.find("NumTiles")
+    out_field = cfg.find("OutputField")
+
+    method = (method_el.text or "EqualRecords").strip() if method_el is not None and method_el.text else "EqualRecords"
+    field_name = (field_el.text or "value").strip() if field_el is not None and field_el.text else "value"
+    n_tiles = int(num_el.text) if num_el is not None and num_el.text and num_el.text.isdigit() else 4
+    out_col = (out_field.text or "Tile_Num").strip() if out_field is not None and out_field.text else "Tile_Num"
+
+    if "Equal" in method and "Records" in method:
+        # Equal records → percentile-based → qcut
+        body = f'    df[{out_col!r}] = pd.qcut(df[{field_name!r}], q={n_tiles}, labels=False, duplicates="drop") + 1'
+    else:
+        # EqualSums / SmartTile / etc. — default to equal-width bins
+        body = f'    df[{out_col!r}] = pd.cut(df[{field_name!r}], bins={n_tiles}, labels=False) + 1'
+
+    py = f'''"""Alteryx Tile (tool {node.tool_id}) — inline pandas qcut / cut.
+
+Assigns a {n_tiles}-tile bucket label to each row based on {field_name!r}.
+Method: {method}.
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="Alteryx Tile (tool {node.tool_id}, {n_tiles}-tile {method})",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    df = upstream.copy()
+{body}
+    return df
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        inline_python=py,
+        notes=[
+            f"Tile on tool {node.tool_id}: Alteryx supports several tile "
+            "methods (EqualRecords / EqualSums / SmartTile / ManualCutoffs). "
+            "We mapped 'EqualRecords' → pd.qcut and everything else → pd.cut. "
+            "Review if you need SmartTile or ManualCutoffs."
+        ],
+    )
+
+
 def _map_sample(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Alteryx Sample → either the `sample` component (Random / 1-in-N modes)
     or an inline @dg.asset .py using pandas `.head(n)` / `.tail(n)` / `.iloc[::n]`
@@ -752,9 +1064,11 @@ def _map_multi_field_formula(node: AlteryxNode, upstreams: List[str], translator
             fn = f.attrib.get("field")
             if fn and f.attrib.get("selected", "True").lower() != "false":
                 fields.append(fn)
-    translated, fully = _translate_simple_expr(raw_expr)
-    notes: List[str] = []
-    if not fully and translator is not None:
+    tr = _translate_expr(raw_expr)
+    translated = tr.pandas_expr
+    notes: List[str] = list(tr.notes)
+
+    if not tr.fully and translator is not None:
         try:
             r = translator.translate_and_score(raw_expr)
             if r.combined_score >= translator.score_threshold and not r.is_python:
@@ -766,16 +1080,27 @@ def _map_multi_field_formula(node: AlteryxNode, upstreams: List[str], translator
             else:
                 notes.append(
                     f"MultiFieldFormula on tool {node.tool_id}: LLM rejected "
-                    f"(score={r.combined_score:.2f} or PYTHON path). Dropped. "
+                    f"(score={r.combined_score:.2f} or PYTHON path; "
+                    f"`multi_field_formula` only takes pandas-eval). Dropped. "
                     f"Original: `{raw_expr}`."
                 )
         except Exception as e:  # noqa: BLE001
             notes.append(f"MultiFieldFormula LLM call failed: {e!s}")
-    elif not fully:
+    elif not tr.fully:
         notes.append(
             f"MultiFieldFormula on tool {node.tool_id}: Alteryx-only function in "
-            f"`{raw_expr}`. Re-run with `--llm-translate <model>` or edit by hand."
+            f"`{raw_expr}` not deterministically translatable. Re-run with "
+            f"`--llm-translate <model>` or edit by hand."
         )
+    if tr.is_python:
+        # multi_field_formula component is pandas-eval-only — can't emit
+        # PYTHON-path. Flag and don't emit a broken expression.
+        notes.append(
+            f"MultiFieldFormula on tool {node.tool_id}: deterministic translation "
+            "needs PYTHON path (Series ops), which `multi_field_formula` doesn't "
+            "support. Consider rewriting as N single-column Formula tools."
+        )
+        translated = ""
     return MappedTool(
         component_id="multi_field_formula",
         asset_name=_asset_name_for(node),

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "alteryx-to-dagster"
-version = "0.2.0"
+version = "0.3.0"
 description = "Convert Alteryx workflows (.yxmd / .yxmz / .yxzp) into Dagster projects, using the community components registry as the transform vocabulary."
 readme = "README.md"
 requires-python = ">=3.10"
