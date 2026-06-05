@@ -33,21 +33,29 @@ uv run dg dev                    # interactive UI at http://localhost:3000
 
 The `--install` flag shells out to `dagster-component add <id> --auto-install` for every registry component the importer used. Without it you'll see a printed list of `add` commands to run yourself.
 
-## Coverage (v1 — deterministic mapping)
+## Coverage (v0.2 — 18 Alteryx tools mapped)
 
-| Alteryx tool | Dagster component |
+| Alteryx tool | Dagster target |
 |---|---|
-| Text Input | inline `@dg.asset` Python (TODO: replace with future `inline_dataframe` component) |
-| Filter | `filter` |
-| Formula | `formula` (untranslatable Alteryx-only functions like `IIF` are dropped + flagged) |
-| Summarize | `summarize` |
-| Join | `dataframe_join` |
-| Union | `dataframe_union` |
-| Sort | `sort` |
-| Unique | `unique_dedup` |
-| Select | `select_columns` |
+| Text Input | inline `@dg.asset` Python (field types preserved from Alteryx Field defs) |
 | Input Data (delimited file) | `dataframe_from_csv` |
 | Output Data | `dataframe_to_csv` / `_excel` / `_parquet` (sniffed by extension) |
+| Filter | `filter` |
+| Formula | `formula` (with v1.5 LLM translation for IIF / Contains / DateTimeAdd / etc.) |
+| Multi-Field Formula | `multi_field_formula` (same LLM path) |
+| Select | `select_columns` |
+| Sort | `sort` |
+| Unique | `unique_dedup` |
+| Sample | `sample` (Random / 1-in-N modes) **or** inline pandas `.head/.tail/.iloc[::n]` (FirstN / LastN / EveryNth — faithful, deterministic) |
+| Record ID | `record_id` |
+| Running Total | `running_total` |
+| Summarize | `summarize` |
+| Count Records | `summarize` (trivial Count) |
+| CrossTab | `pivot` |
+| Transpose | `unpivot` |
+| Join | `dataframe_join` |
+| Union / Append | `dataframe_union` |
+| Append Fields | `append_fields` (cartesian product) |
 
 **What gets translated automatically (v1):**
 - `[Field]` bracket-stripping → bare field name (pandas eval style)
@@ -62,7 +70,22 @@ The `--install` flag shells out to `dagster-component add <id> --auto-install` f
 - Proprietary `.yxdb` data files
 - Tools with no mapping yet
 
-**v1.5 (planned):** LLM-assisted translation of Alteryx-only formula expressions to pandas eval — pair the `formula` flagging step with a `litellm_agent` call. Opt-in via `--llm-assist openai` / `--llm-assist anthropic`.
+**v1.5 (shipped in v0.2):** LLM-assisted translation of Alteryx-only formula expressions. Opt in with `--llm-translate <model>`. Two LiteLLM calls per flagged expression — translate + independent score — at **import time only**. The resulting Dagster project carries zero LLM dependency at materialization.
+
+```bash
+uvx --from alteryx-to-dagster alteryx-to-dagster import workflow.yxmd \
+    --out-dir . --pkg my_project \
+    --llm-translate gpt-4o-mini --llm-api-key-env OPENAI_API_KEY
+```
+
+Translations that score ≥ 0.8 (combined translator self-confidence + independent scorer) get baked into the emitted YAML or — when the translation needs pandas Series ops that `pandas.eval` can't compile — into an inline `@dg.asset` `.py` file using `np.where` / `.str.*` / `.dt.*`. Below the threshold, the expression stays flagged in `MIGRATION.md` for human review (no silent emission of low-confidence translations).
+
+Live-validated end-to-end against `samples/sample_with_iif.yxmd`:
+- `IIF([quantity] > 10, "bulk", "standard")` → `np.where(df["quantity"] > 10, "bulk", "standard")` (PYTHON path, score 0.85)
+- `Contains([product], "Widget")` → `df["product"].str.contains("Widget")` (PYTHON path, score 0.95)
+- Confused / wrong translations (e.g. Alteryx Switch's value/default arg-order confusion) get caught by the scorer and dropped.
+
+Cost: ~$0.0004 per flagged expression at `gpt-4o-mini`. One-time per import.
 
 ## Live-validated end-to-end
 

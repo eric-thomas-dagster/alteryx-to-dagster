@@ -189,38 +189,158 @@ def _map_filter(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     )
 
 
-def _map_formula(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Formula → our `formula` component (pandas eval). Translates
-    bracketed field refs; **drops** non-pandas-evalable expressions from the
-    emitted YAML (so the run doesn't crash on IIF/Switch/Contains/…) and
-    surfaces them in MIGRATION.md for v1.5 LLM-assisted translation."""
+def _map_formula(node: AlteryxNode, upstreams: List[str], translator=None) -> MappedTool:
+    """Alteryx Formula → `formula` component (pandas eval), with optional
+    v1.5 LLM-assisted translation for the expressions v1 had to drop.
+
+    Three buckets per FormulaField:
+
+      1. **Fully deterministic** (math + comparison + bracket-strip only) →
+         emitted into the `formula` component's `expressions` dict.
+      2. **Needs LLM, translator returned a pandas-eval expression with
+         combined_score ≥ threshold** → also into `expressions`. Both
+         original Alteryx + translated pandas surface in MIGRATION.md.
+      3. **Needs LLM, translator returned PYTHON-path (Series-based)** →
+         collected in `python_exprs`. If ANY column needs PYTHON path,
+         the whole formula tool emits as an inline @dg.asset .py file
+         (mixing eval-friendly cols + Series-style cols there).
+      4. **Needs LLM, no translator OR score below threshold** → flagged
+         in MIGRATION.md, NOT emitted. Run won't crash; user re-runs
+         with `--llm-translate <model>` or fixes by hand.
+    """
+    upstream = _single_upstream(upstreams)
+    asset_name = _asset_name_for(node)
+
     expressions: Dict[str, str] = {}
+    python_exprs: Dict[str, str] = {}
     notes: List[str] = []
+
     ff_el = node.config.find("FormulaFields")
     if ff_el is not None:
         for f in ff_el.findall("FormulaField"):
             out_field = f.attrib.get("field", "?")
             expr = f.attrib.get("expression", "")
             translated, fully = _translate_simple_expr(expr)
+
             if fully:
                 expressions[out_field] = translated
-            else:
+                continue
+
+            if translator is None:
                 notes.append(
                     f"Formula on tool {node.tool_id} → column {out_field!r}: "
-                    f"original Alteryx expression `{expr}` uses functions pandas eval "
-                    f"doesn't support (IIF/Switch/Contains/etc.). **Dropped from the "
-                    f"emitted YAML so the run doesn't crash.** Translate manually or "
-                    f"re-run the importer with v1.5 LLM-assisted translation."
+                    f"Alteryx expression `{expr}` uses functions pandas eval "
+                    f"doesn't support (IIF/Switch/Contains/…). Dropped from "
+                    f"emitted YAML so the run doesn't crash. Re-run with "
+                    f"`--llm-translate <model>` to auto-translate, or fix by hand."
                 )
+                continue
+
+            try:
+                r = translator.translate_and_score(expr)
+            except Exception as e:  # noqa: BLE001
+                notes.append(
+                    f"Formula on tool {node.tool_id} → column {out_field!r}: "
+                    f"LLM translation FAILED ({e!s}). Original Alteryx: `{expr}`. "
+                    "Dropped from emitted YAML."
+                )
+                continue
+
+            if r.combined_score < translator.score_threshold:
+                notes.append(
+                    f"Formula on tool {node.tool_id} → column {out_field!r}: "
+                    f"LLM translated `{expr}` → `{r.pandas_expr}` "
+                    f"(combined_score={r.combined_score:.2f} < threshold "
+                    f"{translator.score_threshold:.2f}). DROPPED — review manually. "
+                    f"Scorer: {r.score_reason}"
+                )
+                continue
+
+            if r.is_python:
+                python_exprs[out_field] = r.pandas_expr
+            else:
+                expressions[out_field] = r.pandas_expr
+            notes.append(
+                f"Formula on tool {node.tool_id} → column {out_field!r}: "
+                f"LLM-translated `{expr}` → `{r.pandas_expr}` "
+                f"({'PYTHON path' if r.is_python else 'pandas eval'}, "
+                f"score={r.combined_score:.2f}). {r.reasoning}"
+            )
+
+    # If anything needs PYTHON, emit the whole formula as inline @dg.asset .py.
+    if python_exprs:
+        return _emit_formula_as_python(
+            node=node,
+            upstream=upstream,
+            asset_name=asset_name,
+            eval_exprs=expressions,
+            python_exprs=python_exprs,
+            notes=notes,
+        )
+
     return MappedTool(
         component_id="formula",
-        asset_name=_asset_name_for(node),
+        asset_name=asset_name,
         attributes={
-            "upstream_asset_key": _single_upstream(upstreams),
+            "upstream_asset_key": upstream,
             "expressions": expressions,
             "group_name": "alteryx_imported",
         },
         notes=notes,
+    )
+
+
+def _emit_formula_as_python(
+    *,
+    node: AlteryxNode,
+    upstream: str,
+    asset_name: str,
+    eval_exprs: Dict[str, str],
+    python_exprs: Dict[str, str],
+    notes: List[str],
+) -> MappedTool:
+    """Emit a formula tool as a small inline @dg.asset .py when at least
+    one output column needs the PYTHON path. Result is fully deterministic
+    at runtime — no LLM calls during materialization."""
+    lines = []
+    for col, expr in eval_exprs.items():
+        # Keep these consistent with the `formula` component's semantics: df.eval(expr).
+        lines.append(f'    df[{col!r}] = df.eval({expr!r})')
+    for col, py_expr in python_exprs.items():
+        lines.append(f'    df[{col!r}] = {py_expr}')
+    body = "\n".join(lines) if lines else "    pass"
+
+    py = f'''"""Alteryx Formula (tool {node.tool_id}) — emitted as inline Python.
+
+At least one output column required the PYTHON path (pandas Series ops
+like .str / .dt that pandas eval can't compile), so the whole formula
+landed here as a single @dg.asset. The result is fully deterministic at
+runtime — no LLM calls happen during materialization.
+
+LLM was used at import time only to translate Alteryx-only functions to
+their pandas equivalents. See MIGRATION.md for the score per expression.
+"""
+import dagster as dg
+import numpy as np  # noqa: F401  (available for PYTHON-path expressions)
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="Alteryx Formula (tool {node.tool_id}) — LLM-assisted inline Python.",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    df = upstream.copy()
+{body}
+    return df
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        notes=notes,
+        inline_python=py,
     )
 
 
@@ -399,6 +519,276 @@ def _map_output_csv(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     )
 
 
+def _map_sample(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Sample → either the `sample` component (Random / 1-in-N modes)
+    or an inline @dg.asset .py using pandas `.head(n)` / `.tail(n)` / `.iloc[::n]`
+    for the FirstN / LastN / EveryNth modes, since the `sample` component is
+    random-only and there's no head/tail component in the registry yet.
+
+    Maps faithfully — Alteryx's FirstN is deterministic, not a random sample,
+    so we can't silently substitute random sampling there.
+    """
+    mode_el = node.config.find("Mode")
+    n_el = node.config.find("N")
+    mode = (mode_el.text or "First").strip() if mode_el is not None else "First"
+    n = int(n_el.text) if n_el is not None and n_el.text and n_el.text.isdigit() else 1
+    asset_name = _asset_name_for(node)
+    upstream = _single_upstream(upstreams)
+    mode_lower = mode.lower().replace("n", "")  # "firstn" → "first", "lastn" → "last"
+
+    if mode_lower in ("first", ""):
+        body = f"    return upstream.head({n})"
+        descr = f"Alteryx Sample FirstN={n}"
+    elif mode_lower == "last":
+        body = f"    return upstream.tail({n})"
+        descr = f"Alteryx Sample LastN={n}"
+    elif mode_lower in ("everynth", "every"):
+        body = f"    return upstream.iloc[::{n}].copy()"
+        descr = f"Alteryx Sample EveryNth={n}"
+    elif mode_lower in ("random", "randomn"):
+        # Faithful to a random sample — use the `sample` component.
+        return MappedTool(
+            component_id="sample",
+            asset_name=asset_name,
+            attributes={
+                "upstream_asset_key": upstream,
+                "sample_size": n,
+                "group_name": "alteryx_imported",
+            },
+        )
+    elif mode_lower in ("1in", "1innn"):
+        return MappedTool(
+            component_id="sample",
+            asset_name=asset_name,
+            attributes={
+                "upstream_asset_key": upstream,
+                "frac": 1.0 / max(n, 1),
+                "group_name": "alteryx_imported",
+            },
+        )
+    else:
+        body = f"    return upstream.head({n})  # unknown Alteryx Sample mode {mode!r}, defaulting to head"
+        descr = f"Alteryx Sample (mode={mode}, fallback to head)"
+
+    py = f'''"""Alteryx Sample (tool {node.tool_id}) — emitted as inline pandas.
+
+The registry's `sample` component is random-only; Alteryx's FirstN /
+LastN / EveryNth are deterministic, so we use pandas .head/.tail/.iloc
+directly. Fully deterministic at runtime.
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
+    description="{descr}",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+{body}
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=asset_name,
+        inline_python=py,
+    )
+
+
+def _map_record_id(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Record ID → `record_id` (adds a sequence column)."""
+    start_el = node.config.find("StartValue")
+    name_el = node.config.find("FieldName")
+    start = int(start_el.text) if start_el is not None and start_el.text and start_el.text.lstrip("-").isdigit() else 1
+    col_name = (name_el.text or "RecordID").strip() if name_el is not None else "RecordID"
+    return MappedTool(
+        component_id="record_id",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "output_column": col_name,            # component calls it `output_column`, not `column_name`
+            "start": start,
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_running_total(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Running Total → `running_total` (cumulative sum by group)."""
+    group_by: List[str] = []
+    fields: List[str] = []
+    rt_el = node.config.find("RunningTotalFields")
+    if rt_el is not None:
+        for f in rt_el.findall("Field"):
+            fn = f.attrib.get("field")
+            if fn:
+                fields.append(fn)
+    gb_el = node.config.find("GroupBy")
+    if gb_el is not None:
+        for f in gb_el.findall("Field"):
+            fn = f.attrib.get("field")
+            if fn:
+                group_by.append(fn)
+    return MappedTool(
+        component_id="running_total",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "columns": fields,
+            "group_by": group_by,
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_append_fields(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Append Fields → cartesian product. The component takes a
+    Target (the bigger input) + a Source (the field-list to broadcast)."""
+    return MappedTool(
+        component_id="append_fields",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key_target": upstreams[0] if upstreams else "",
+            "upstream_asset_key_source": upstreams[1] if len(upstreams) > 1 else "",
+            "group_name": "alteryx_imported",
+        },
+        notes=[
+            f"AppendFields on tool {node.tool_id}: produces a cartesian product. "
+            "Alteryx warns past ~16 source rows; same caveat applies here."
+        ],
+    )
+
+
+def _map_cross_tab(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx CrossTab → `pivot` (or our `cross_tab` if you prefer that name)."""
+    group_by: List[str] = []
+    header_field = None
+    value_field = None
+    method = "sum"
+    cfg = node.config
+    for f in cfg.findall("GroupFields/Field"):
+        fn = f.attrib.get("field")
+        if fn:
+            group_by.append(fn)
+    hf = cfg.find("HeaderField")
+    if hf is not None:
+        header_field = hf.attrib.get("field") or (hf.text or "").strip() or None
+    vf = cfg.find("DataField")
+    if vf is not None:
+        value_field = vf.attrib.get("field") or (vf.text or "").strip() or None
+    methods = cfg.find("Methods")
+    if methods is not None:
+        m = methods.find("Method")
+        if m is not None and m.text:
+            method = m.text.strip().lower()
+    return MappedTool(
+        component_id="pivot",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "index": group_by,
+            "columns": header_field,
+            "values": value_field,
+            "aggfunc": method,
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_transpose(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Transpose → `unpivot` (wide → long)."""
+    key_fields: List[str] = []
+    data_fields: List[str] = []
+    cfg = node.config
+    for f in cfg.findall("KeyFields/Field"):
+        fn = f.attrib.get("field")
+        if fn:
+            key_fields.append(fn)
+    for f in cfg.findall("DataFields/Field"):
+        fn = f.attrib.get("field")
+        if fn and f.attrib.get("selected", "True").lower() != "false":
+            data_fields.append(fn)
+    return MappedTool(
+        component_id="unpivot",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "id_vars": key_fields,
+            "value_vars": data_fields,
+            "var_name": "Name",
+            "value_name": "Value",
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_count_records(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Count Records → `summarize` with a trivial Count aggregation."""
+    out_name_el = node.config.find("FieldName")
+    out_name = (out_name_el.text or "Count").strip() if out_name_el is not None else "Count"
+    return MappedTool(
+        component_id="summarize",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "group_by": [],
+            "aggregations": {out_name: "size"},
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_multi_field_formula(node: AlteryxNode, upstreams: List[str], translator=None) -> MappedTool:
+    """Alteryx Multi-Field Formula → our `multi_field_formula` component.
+    Applies the same expression to a list of columns. Same translator
+    flow as `_map_formula`."""
+    expr_el = node.config.find("Expression")
+    raw_expr = (expr_el.text or "").strip() if expr_el is not None else ""
+    fields: List[str] = []
+    fl_el = node.config.find("Fields")
+    if fl_el is not None:
+        for f in fl_el.findall("Field"):
+            fn = f.attrib.get("field")
+            if fn and f.attrib.get("selected", "True").lower() != "false":
+                fields.append(fn)
+    translated, fully = _translate_simple_expr(raw_expr)
+    notes: List[str] = []
+    if not fully and translator is not None:
+        try:
+            r = translator.translate_and_score(raw_expr)
+            if r.combined_score >= translator.score_threshold and not r.is_python:
+                translated = r.pandas_expr
+                notes.append(
+                    f"MultiFieldFormula on tool {node.tool_id}: LLM-translated "
+                    f"`{raw_expr}` → `{translated}` (score={r.combined_score:.2f})."
+                )
+            else:
+                notes.append(
+                    f"MultiFieldFormula on tool {node.tool_id}: LLM rejected "
+                    f"(score={r.combined_score:.2f} or PYTHON path). Dropped. "
+                    f"Original: `{raw_expr}`."
+                )
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"MultiFieldFormula LLM call failed: {e!s}")
+    elif not fully:
+        notes.append(
+            f"MultiFieldFormula on tool {node.tool_id}: Alteryx-only function in "
+            f"`{raw_expr}`. Re-run with `--llm-translate <model>` or edit by hand."
+        )
+    return MappedTool(
+        component_id="multi_field_formula",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "fields": fields,
+            "expression": translated,
+            "group_name": "alteryx_imported",
+        },
+        notes=notes,
+    )
+
+
 def _map_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Alteryx Select tool — keep/rename/reorder columns."""
     keep: List[str] = []
@@ -430,30 +820,60 @@ def _map_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 ToolMapping = Callable[[AlteryxNode, List[str]], MappedTool]
 
 PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
+    # Inputs / outputs
     "AlteryxBasePluginsGui.TextInput.TextInput": _map_text_input,
-    "AlteryxBasePluginsGui.Filter.Filter": _map_filter,
-    "AlteryxBasePluginsGui.Formula.Formula": _map_formula,
-    "AlteryxBasePluginsGui.Summarize.Summarize": _map_summarize,
-    "AlteryxBasePluginsGui.Join.Join": _map_join,
-    "AlteryxBasePluginsGui.Union.Union": _map_union,
-    "AlteryxBasePluginsGui.Sort.Sort": _map_sort,
-    "AlteryxBasePluginsGui.Unique.Unique": _map_unique,
-    "AlteryxBasePluginsGui.Select.Select": _map_select,
     "AlteryxBasePluginsGui.DbFileInput.DbFileInput": _map_input_csv,
     "AlteryxBasePluginsGui.DbFileOutput.DbFileOutput": _map_output_csv,
+    # Row / column selection
+    "AlteryxBasePluginsGui.Filter.Filter": _map_filter,
+    "AlteryxBasePluginsGui.Select.Select": _map_select,
+    "AlteryxBasePluginsGui.Sort.Sort": _map_sort,
+    "AlteryxBasePluginsGui.Unique.Unique": _map_unique,
+    "AlteryxBasePluginsGui.Sample.Sample": _map_sample,
+    # Transforms
+    "AlteryxBasePluginsGui.Formula.Formula": _map_formula,
+    "AlteryxBasePluginsGui.MultiFieldFormula.MultiFieldFormula": _map_multi_field_formula,
+    "AlteryxBasePluginsGui.RecordID.RecordID": _map_record_id,
+    "AlteryxBasePluginsGui.RunningTotal.RunningTotal": _map_running_total,
+    # Aggregates / reshape
+    "AlteryxBasePluginsGui.Summarize.Summarize": _map_summarize,
+    "AlteryxBasePluginsGui.CountRecords.CountRecords": _map_count_records,
+    "AlteryxBasePluginsGui.CrossTab.CrossTab": _map_cross_tab,
+    "AlteryxBasePluginsGui.Transpose.Transpose": _map_transpose,
+    # Multi-input
+    "AlteryxBasePluginsGui.Join.Join": _map_join,
+    "AlteryxBasePluginsGui.Union.Union": _map_union,
+    # Append is just Union for our purposes — alias.
+    "AlteryxBasePluginsGui.Append.Append": _map_union,
+    "AlteryxBasePluginsGui.AppendFields.AppendFields": _map_append_fields,
 }
 
 
-def map_tool(node: AlteryxNode, upstreams: List[str]):
-    """Returns either a MappedTool or an UnmappedTool."""
+# A subset of mappers accepts a `translator` kwarg (the LLM-assisted ones).
+# We dispatch by introspecting the function — keeps the public ToolMapping
+# type clean and means mappers that don't need translation don't have to
+# care about it.
+_TRANSLATOR_AWARE_MAPPERS = frozenset({"_map_formula", "_map_multi_field_formula"})
+
+
+def map_tool(node: AlteryxNode, upstreams: List[str], translator=None):
+    """Returns either a MappedTool or an UnmappedTool.
+
+    `translator`: optional LLMTranslator. When supplied, the formula /
+    multi-field-formula mappers send Alteryx-only expressions
+    (IIF / Contains / DateTimeAdd / …) through the LLM at import time.
+    Other mappers ignore it.
+    """
     fn = PLUGIN_REGISTRY.get(node.plugin)
     if fn is None:
         return UnmappedTool(
             reason=f"No mapping for plugin {node.plugin!r}",
             suggestion=(
-                "Register a mapper in dagster_component_cli.alteryx_importer.mapper, "
+                "Register a mapper in alteryx_to_dagster.mapper.PLUGIN_REGISTRY, "
                 "or rebuild this tool's logic manually using "
                 "`dagster-component search <keyword>` to find an equivalent."
             ),
         )
+    if translator is not None and fn.__name__ in _TRANSLATOR_AWARE_MAPPERS:
+        return fn(node, upstreams, translator=translator)
     return fn(node, upstreams)

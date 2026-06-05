@@ -18,21 +18,28 @@ import yaml
 from .mapper import MappedTool
 
 
-# Map registry id → ComponentClassName for the `type:` line. We could
-# fetch this dynamically from the manifest, but the small static table is
-# faster + keeps the importer offline-runnable.
-# Class names taken from the installed component source — case matters
-# (e.g. `DataframeToCsv` not `DataFrameToCsv`). When adding new entries,
-# grep the component.py: `grep '^class.*Component' .../component.py`.
+# Map registry id → ComponentClassName for the `type:` line.
+#
+# ⚠️ Case matters AND the `*Component` suffix is NOT universal —
+# `append_fields`, `dataframe_join`, `dataframe_union` drop it. When adding
+# new entries, grep the installed source:
+#   grep '^class .*Component\|^class [A-Za-z]\+(Component' .../component.py
 _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "filter": "FilterComponent",
     "formula": "FormulaComponent",
+    "multi_field_formula": "MultiFieldFormulaComponent",
     "summarize": "SummarizeComponent",
-    "dataframe_join": "DataframeJoinComponent",
-    "dataframe_union": "DataframeUnionComponent",
     "sort": "SortComponent",
     "unique_dedup": "UniqueDedupComponent",
     "select_columns": "SelectColumnsComponent",
+    "sample": "SampleComponent",
+    "record_id": "RecordIdComponent",
+    "running_total": "RunningTotalComponent",
+    "pivot": "PivotComponent",
+    "unpivot": "UnpivotComponent",
+    "append_fields": "AppendFields",       # no -Component suffix
+    "dataframe_join": "DataframeJoin",     # no -Component suffix
+    "dataframe_union": "DataframeUnion",   # no -Component suffix
     "dataframe_from_csv": "DataframeFromCsvComponent",
     "dataframe_to_csv": "DataframeToCsvComponent",
     "dataframe_to_excel": "DataframeToExcelComponent",

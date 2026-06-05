@@ -44,9 +44,51 @@ def main() -> None:
     is_flag=True,
     help="After emitting defs.yamls, run `dagster-component add <id> --auto-install` for each component used.",
 )
-def import_cmd(yxmd_path: str, out_dir: str, pkg: str, install: bool) -> None:
+@click.option(
+    "--llm-translate",
+    default=None,
+    metavar="MODEL",
+    help=(
+        "Enable v1.5 LLM-assisted translation of Alteryx-only formula expressions "
+        "(IIF / Contains / DateTimeAdd / etc.). Pass a LiteLLM model id "
+        "(e.g. gpt-4o-mini, claude-haiku-4-5-20251001, gemini/gemini-2.5-flash). "
+        "LLM is used at import time ONLY — the resulting Dagster project carries "
+        "no LLM dependency at materialization time."
+    ),
+)
+@click.option(
+    "--llm-api-key-env",
+    default=None,
+    metavar="ENV_VAR",
+    help="Env var holding the LLM API key (e.g. OPENAI_API_KEY).",
+)
+@click.option(
+    "--llm-score-threshold",
+    default=0.8,
+    type=float,
+    show_default=True,
+    help="Translations with combined_score below this stay flagged in MIGRATION.md (not emitted).",
+)
+def import_cmd(
+    yxmd_path: str,
+    out_dir: str,
+    pkg: str,
+    install: bool,
+    llm_translate: str | None,
+    llm_api_key_env: str | None,
+    llm_score_threshold: float,
+) -> None:
     click.echo(f"Importing {yxmd_path} → {out_dir} (pkg={pkg})")
-    result = import_workflow(yxmd_path=yxmd_path, out_dir=out_dir, pkg=pkg)
+    if llm_translate:
+        click.echo(f"  LLM-assisted translation: model={llm_translate}, threshold={llm_score_threshold}")
+    result = import_workflow(
+        yxmd_path=yxmd_path,
+        out_dir=out_dir,
+        pkg=pkg,
+        llm_translate=llm_translate,
+        llm_api_key_env=llm_api_key_env,
+        llm_score_threshold=llm_score_threshold,
+    )
     click.echo(f"  ✓ mapped tools:    {result['mapped_count']}")
     click.echo(f"  ✓ unmapped tools:  {result['unmapped_count']}")
     click.echo(f"  ✓ components used: {', '.join(result['component_ids']) or '(none)'}")

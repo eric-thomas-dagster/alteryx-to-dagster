@@ -56,8 +56,18 @@ def import_workflow(
     yxmd_path: str | Path,
     out_dir: str | Path,
     pkg: str,
+    *,
+    llm_translate: str | None = None,
+    llm_api_key_env: str | None = None,
+    llm_score_threshold: float = 0.8,
 ) -> Dict[str, object]:
-    """Parse the .yxmd / .yxmz and emit defs.yaml + .py files under out_dir.
+    """Parse the .yxmd / .yxmz / .yxzp and emit defs.yaml + .py files under out_dir.
+
+    `llm_translate`: when set to a LiteLLM model id (e.g. "gpt-4o-mini",
+    "claude-haiku-4-5-20251001"), the importer makes two LLM calls per
+    flagged Alteryx-only formula expression (translate + independent
+    score). Translations meeting `llm_score_threshold` get baked into
+    the emitted YAML / .py. **No LLM dependency at materialization time.**
 
     Returns a summary dict: {
         "mapped_count": int,
@@ -65,18 +75,25 @@ def import_workflow(
         "component_ids": [...],
         "migration_report": Path,
         "files_written": [Path, ...],
+        "llm_calls_made": int,
     }
     """
     yxmd_path = Path(yxmd_path)
     out_dir = Path(out_dir)
 
+    translator = None
+    if llm_translate:
+        from .llm_translator import LLMTranslator
+        translator = LLMTranslator(
+            model=llm_translate,
+            api_key_env_var=llm_api_key_env,
+            score_threshold=llm_score_threshold,
+        )
+
     wf = parse_workflow(yxmd_path)
     ordered = _topo_sort(wf)
 
-    # Asset names get assigned during mapping; we need them to resolve
-    # downstream `upstream_asset_key` references.
     tool_to_asset: Dict[str, str] = {}
-
     mapped_results: List[Tuple[str, str, str, str, List[str]]] = []   # for the report
     unmapped_results: List[Tuple[str, str, str, str]] = []
     component_ids_used: List[str] = []
@@ -91,7 +108,7 @@ def import_workflow(
         )
         upstreams = [tool_to_asset.get(e.origin_tool, "") for e in incoming_edges]
 
-        result = map_tool(node, upstreams)
+        result = map_tool(node, upstreams, translator=translator)
         if isinstance(result, UnmappedTool):
             unmapped_results.append((node.tool_id, node.plugin, result.reason, result.suggestion))
             # We can't link downstreams to a missing asset — leave tool_to_asset empty
