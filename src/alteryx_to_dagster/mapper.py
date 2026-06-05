@@ -1,0 +1,459 @@
+"""Alteryx tool → Dagster community component mapping.
+
+A `ToolMapping` callable takes the parser's AlteryxNode + the inferred
+upstream asset names (in connection-anchor order) and returns either:
+
+  - a MappedTool (component_id + asset_name + attributes dict + notes)
+  - None, signalling "no mapping for this tool" → flagged in MIGRATION.md
+"""
+from __future__ import annotations
+
+import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional
+
+from .parser import AlteryxNode
+
+
+@dataclass
+class MappedTool:
+    component_id: str                       # e.g. "filter" — registry id
+    asset_name: str                         # e.g. "high_volume_orders"
+    attributes: Dict[str, object] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)   # caveats surfaced in MIGRATION.md
+    inline_python: Optional[str] = None     # if non-None, emit a .py file instead of defs.yaml
+
+
+@dataclass
+class UnmappedTool:
+    reason: str                             # why we couldn't map it
+    suggestion: str = ""                    # how the user might fix it manually
+
+
+# ---------------------------------------------------------------- helpers
+
+_BRACKETED_FIELD = re.compile(r"\[([^\[\]]+)\]")
+
+
+def _strip_field_brackets(expr: str) -> str:
+    """Alteryx wraps field refs in [Brackets]; pandas eval just uses the bare name."""
+    return _BRACKETED_FIELD.sub(r"\1", expr)
+
+
+def _translate_simple_expr(expr: str) -> tuple[str, bool]:
+    """Best-effort Alteryx expression → pandas eval. Returns (expr, fully_translated).
+
+    Handles:
+      - [Field] → Field (bracket stripping)
+      - Simple arithmetic / comparison passthrough
+    Flags as not-fully-translated when we see Alteryx-only constructs (IIF,
+    Contains, DateTimeAdd, Switch, etc.) — those become TODOs the user (or
+    the v1.5 LLM step) resolves.
+    """
+    stripped = _strip_field_brackets(expr).strip()
+    # Detect Alteryx-specific function calls that pandas eval can't handle.
+    alteryx_only = re.compile(
+        r"\b(IIF|Switch|Contains|StartsWith|EndsWith|DateTimeAdd|DateTimeDiff|"
+        r"DateTimeFormat|DateTimeParse|Substring|Regex|Length|Trim|UpperCase|LowerCase|"
+        r"ToString|ToNumber|Null|IsNull|IsEmpty|FindString|PadLeft|PadRight)\s*\(",
+        re.IGNORECASE,
+    )
+    fully = alteryx_only.search(stripped) is None
+    return stripped, fully
+
+
+def _ascii_safe(s: str) -> str:
+    """Asset-name-safe identifier (lower_snake_case, ASCII)."""
+    s = re.sub(r"[^a-zA-Z0-9_]", "_", s.strip().lower())
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "asset"
+
+
+def _asset_name_for(node: AlteryxNode) -> str:
+    """Prefer the annotation; fall back to plugin_short + tool_id."""
+    if node.annotation:
+        return _ascii_safe(node.annotation)
+    return _ascii_safe(f"{node.plugin_short}_{node.tool_id}")
+
+
+def _single_upstream(upstreams: List[str]) -> str:
+    if not upstreams:
+        return ""
+    return upstreams[0]
+
+
+# ---------------------------------------------------------------- mappers
+
+def _map_text_input(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
+    """Alteryx Text Input: inline rows. We emit a small @dg.asset that
+    returns a literal DataFrame, since the registry has no `inline_dataframe`
+    component yet. Field types come from the Alteryx Field type attribute —
+    Int32 / Int16 / Byte → int; Double / Float / Decimal → float; everything
+    else → str. Without type coercion downstream filters / formulas blow up
+    on string-vs-int comparisons.
+    """
+    cfg = node.config
+    name = _asset_name_for(node)
+
+    # (field_name, alteryx_type) in declaration order.
+    field_specs: List[tuple[str, str]] = []
+    fields_el = cfg.find("Fields")
+    if fields_el is not None:
+        for f in fields_el.findall("Field"):
+            fn = f.attrib.get("name")
+            if fn:
+                field_specs.append((fn, f.attrib.get("type", "V_String")))
+
+    rows: List[List[str]] = []
+    data_el = cfg.find("Data")
+    if data_el is not None:
+        for r in data_el.findall("r"):
+            rows.append([(c.text or "") for c in r.findall("c")])
+
+    # Build a `dtypes` dict for pandas. Alteryx int types -> Int64 (nullable);
+    # float types -> float; everything else -> string.
+    int_types = {"byte", "int16", "int32", "int64"}
+    float_types = {"float", "double", "decimal", "fixeddecimal"}
+    dtypes: dict[str, str] = {}
+    for fn, atype in field_specs:
+        lower = atype.lower()
+        if lower in int_types:
+            dtypes[fn] = "Int64"      # nullable int — handles "" gracefully
+        elif lower in float_types:
+            dtypes[fn] = "float64"
+        else:
+            dtypes[fn] = "string"
+
+    column_names = [fn for fn, _t in field_specs]
+    rows_repr = ",\n        ".join(repr(r) for r in rows)
+    py = f'''"""Alteryx Text Input — inline data. Auto-generated by alteryx-import.
+
+TODO: consider replacing with an `inline_dataframe` registry component
+when one ships. Right now this is a small custom .py so the imported
+project loads cleanly without a new component dep.
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(group_name="alteryx_imported", description="Alteryx Text Input (tool {node.tool_id})")
+def {name}() -> pd.DataFrame:
+    columns = {column_names!r}
+    rows = [
+        {rows_repr},
+    ]
+    # Column types preserved from the Alteryx Text Input field defs:
+    # {dict(dtypes)}
+    df = pd.DataFrame(rows, columns=columns)
+    for col, dtype in {dtypes!r}.items():
+        if dtype in ("Int64", "float64"):
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(dtype)
+        else:
+            df[col] = df[col].astype(dtype)
+    return df
+'''
+    return MappedTool(
+        component_id="(inline_python)",
+        asset_name=name,
+        notes=[
+            f"Tool {node.tool_id} (Text Input) emitted as inline Python — "
+            "fields, rows, and column dtypes were preserved from the Alteryx "
+            "field defs. Consider replacing with an `inline_dataframe` "
+            "registry component once one exists."
+        ],
+        inline_python=py,
+    )
+
+
+def _map_filter(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    expr_el = node.config.find("Expression")
+    raw_expr = (expr_el.text or "").strip() if expr_el is not None else ""
+    translated, fully = _translate_simple_expr(raw_expr)
+    notes = []
+    if not fully:
+        notes.append(
+            f"Filter expression on tool {node.tool_id} contains Alteryx-only "
+            f"functions: `{raw_expr}` → translated as `{translated}`. "
+            "Review and adjust to pandas eval (or wait for v1.5 LLM-assisted translation)."
+        )
+    return MappedTool(
+        component_id="filter",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "condition": translated,           # `filter` component calls it `condition`, not `filter_expression`
+            "group_name": "alteryx_imported",
+        },
+        notes=notes,
+    )
+
+
+def _map_formula(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Formula → our `formula` component (pandas eval). Translates
+    bracketed field refs; **drops** non-pandas-evalable expressions from the
+    emitted YAML (so the run doesn't crash on IIF/Switch/Contains/…) and
+    surfaces them in MIGRATION.md for v1.5 LLM-assisted translation."""
+    expressions: Dict[str, str] = {}
+    notes: List[str] = []
+    ff_el = node.config.find("FormulaFields")
+    if ff_el is not None:
+        for f in ff_el.findall("FormulaField"):
+            out_field = f.attrib.get("field", "?")
+            expr = f.attrib.get("expression", "")
+            translated, fully = _translate_simple_expr(expr)
+            if fully:
+                expressions[out_field] = translated
+            else:
+                notes.append(
+                    f"Formula on tool {node.tool_id} → column {out_field!r}: "
+                    f"original Alteryx expression `{expr}` uses functions pandas eval "
+                    f"doesn't support (IIF/Switch/Contains/etc.). **Dropped from the "
+                    f"emitted YAML so the run doesn't crash.** Translate manually or "
+                    f"re-run the importer with v1.5 LLM-assisted translation."
+                )
+    return MappedTool(
+        component_id="formula",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "expressions": expressions,
+            "group_name": "alteryx_imported",
+        },
+        notes=notes,
+    )
+
+
+def _map_summarize(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Summarize → our `summarize` component.
+
+    Shape: `aggregations` is a dict, not a list. Two forms:
+      - Simple: `{revenue: sum}` — aggregate that column with that func, output column
+        keeps the source name.
+      - Named:  `{total_revenue: {col: revenue, agg: sum}}` — output a named column
+        from a chosen source. Use the named form whenever Alteryx supplies a rename.
+    """
+    group_by: List[str] = []
+    aggs: Dict[str, object] = {}
+    sf_el = node.config.find("SummarizeFields")
+    if sf_el is not None:
+        for f in sf_el.findall("SummarizeField"):
+            field_name = f.attrib.get("field", "")
+            action = f.attrib.get("action", "").lower()
+            rename = f.attrib.get("rename") or None
+            if action == "groupby":
+                group_by.append(field_name)
+            else:
+                if rename and rename != field_name:
+                    aggs[rename] = {"col": field_name, "agg": action}
+                else:
+                    aggs[field_name] = action
+    return MappedTool(
+        component_id="summarize",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "group_by": group_by,
+            "aggregations": aggs,
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_join(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    join_fields_l: List[str] = []
+    join_fields_r: List[str] = []
+    jf_el = node.config.find("JoinInfo")
+    if jf_el is not None:
+        for f in jf_el.findall("Field"):
+            l = f.attrib.get("field")
+            r = f.attrib.get("field2") or l
+            if l:
+                join_fields_l.append(l)
+            if r:
+                join_fields_r.append(r)
+    return MappedTool(
+        component_id="dataframe_join",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key_left": upstreams[0] if upstreams else "",
+            "upstream_asset_key_right": upstreams[1] if len(upstreams) > 1 else "",
+            "left_on": join_fields_l,
+            "right_on": join_fields_r,
+            "how": "inner",
+            "group_name": "alteryx_imported",
+        },
+        notes=[
+            f"Join on tool {node.tool_id}: Alteryx's Join also emits Left-Unjoined "
+            "and Right-Unjoined anchors. The default mapping is inner-join only. "
+            "If downstream tools consume the L/R anchors, you'll need additional "
+            "filter assets to recreate the antijoin behaviour."
+        ] if jf_el is not None else [],
+    )
+
+
+def _map_union(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    return MappedTool(
+        component_id="dataframe_union",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_keys": upstreams,
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_sort(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    by: List[str] = []
+    ascending: List[bool] = []
+    sf_el = node.config.find("SortInfo")
+    if sf_el is not None:
+        for f in sf_el.findall("Field"):
+            fn = f.attrib.get("field")
+            order = f.attrib.get("order", "Ascending")
+            if fn:
+                by.append(fn)
+                ascending.append(order.lower().startswith("asc"))
+    return MappedTool(
+        component_id="sort",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "by": by,
+            "ascending": ascending,
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_unique(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    fields: List[str] = []
+    uf_el = node.config.find("UniqueFields")
+    if uf_el is not None:
+        for f in uf_el.findall("Field"):
+            fn = f.attrib.get("field")
+            if fn:
+                fields.append(fn)
+    return MappedTool(
+        component_id="unique_dedup",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "subset": fields,
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_input_csv(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
+    """Alteryx Input Data tool reading a delimited file. CSV-flavored mapping."""
+    # NB: Element.__bool__ returns False when the element has no children,
+    # so `find("File") or find("Connection")` silently drops File when it
+    # only carries text. Use explicit `is not None` instead.
+    file_el = node.config.find("File")
+    if file_el is None:
+        file_el = node.config.find("Connection")
+    file_path = (file_el.text or "").strip() if file_el is not None else ""
+    return MappedTool(
+        component_id="dataframe_from_csv",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "path": file_path,
+            "group_name": "alteryx_imported",
+        },
+        notes=[
+            f"Input Data on tool {node.tool_id}: assumed CSV. For Excel / parquet / DB "
+            "inputs, swap `dataframe_from_csv` for `dataframe_from_excel` / "
+            "`dataframe_from_parquet` / a `*_resource` + `sql_transform`."
+        ],
+    )
+
+
+def _map_output_csv(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Output Data tool writing a delimited file."""
+    file_el = node.config.find("File")
+    if file_el is None:
+        file_el = node.config.find("Connection")
+    file_path = (file_el.text or "").strip() if file_el is not None else ""
+    # Sniff format by extension; default to CSV.
+    fmt = "csv"
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    if ext in ("xlsx", "xls"):
+        fmt = "excel"
+    elif ext == "parquet":
+        fmt = "parquet"
+    component_id = {
+        "csv": "dataframe_to_csv",
+        "excel": "dataframe_to_excel",
+        "parquet": "dataframe_to_parquet",
+    }[fmt]
+    return MappedTool(
+        component_id=component_id,
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            # `dataframe_to_csv` / `_excel` / `_parquet` all use `file_path`, not `path`.
+            "file_path": file_path,
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Select tool — keep/rename/reorder columns."""
+    keep: List[str] = []
+    rename_map: Dict[str, str] = {}
+    sf_el = node.config.find("SelectFields") or node.config.find("Fields")
+    if sf_el is not None:
+        for f in sf_el.findall("SelectField") + sf_el.findall("Field"):
+            fn = f.attrib.get("field")
+            selected = f.attrib.get("selected", "True").lower() != "false"
+            rename = f.attrib.get("rename")
+            if fn and selected and fn != "*Unknown":
+                keep.append(rename or fn)
+                if rename and rename != fn:
+                    rename_map[fn] = rename
+    return MappedTool(
+        component_id="select_columns",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "columns": keep,
+            "rename": rename_map or None,
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+# ---------------------------------------------------------------- registry
+
+ToolMapping = Callable[[AlteryxNode, List[str]], MappedTool]
+
+PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
+    "AlteryxBasePluginsGui.TextInput.TextInput": _map_text_input,
+    "AlteryxBasePluginsGui.Filter.Filter": _map_filter,
+    "AlteryxBasePluginsGui.Formula.Formula": _map_formula,
+    "AlteryxBasePluginsGui.Summarize.Summarize": _map_summarize,
+    "AlteryxBasePluginsGui.Join.Join": _map_join,
+    "AlteryxBasePluginsGui.Union.Union": _map_union,
+    "AlteryxBasePluginsGui.Sort.Sort": _map_sort,
+    "AlteryxBasePluginsGui.Unique.Unique": _map_unique,
+    "AlteryxBasePluginsGui.Select.Select": _map_select,
+    "AlteryxBasePluginsGui.DbFileInput.DbFileInput": _map_input_csv,
+    "AlteryxBasePluginsGui.DbFileOutput.DbFileOutput": _map_output_csv,
+}
+
+
+def map_tool(node: AlteryxNode, upstreams: List[str]):
+    """Returns either a MappedTool or an UnmappedTool."""
+    fn = PLUGIN_REGISTRY.get(node.plugin)
+    if fn is None:
+        return UnmappedTool(
+            reason=f"No mapping for plugin {node.plugin!r}",
+            suggestion=(
+                "Register a mapper in dagster_component_cli.alteryx_importer.mapper, "
+                "or rebuild this tool's logic manually using "
+                "`dagster-component search <keyword>` to find an equivalent."
+            ),
+        )
+    return fn(node, upstreams)

@@ -1,0 +1,97 @@
+<?xml version="1.0"?>
+<AlteryxDocument yxmdVer="2023.1">
+  <Nodes>
+    <Node ToolID="1">
+      <GuiSettings Plugin="AlteryxBasePluginsGui.TextInput.TextInput">
+        <Position x="54" y="54"/>
+      </GuiSettings>
+      <Properties>
+        <Configuration>
+          <NumRows value="4"/>
+          <Fields>
+            <Field name="region" type="V_String" size="50"/>
+            <Field name="product" type="V_String" size="50"/>
+            <Field name="quantity" type="Int32"/>
+            <Field name="unit_price" type="Double"/>
+          </Fields>
+          <Data>
+            <r><c>North</c><c>Widget</c><c>10</c><c>5.50</c></r>
+            <r><c>North</c><c>Gadget</c><c>3</c><c>12.00</c></r>
+            <r><c>South</c><c>Widget</c><c>7</c><c>5.50</c></r>
+            <r><c>South</c><c>Gadget</c><c>15</c><c>12.00</c></r>
+          </Data>
+        </Configuration>
+      </Properties>
+      <Annotation DefaultAnnotationText="raw_sales"/>
+    </Node>
+    <Node ToolID="2">
+      <GuiSettings Plugin="AlteryxBasePluginsGui.Filter.Filter">
+        <Position x="200" y="54"/>
+      </GuiSettings>
+      <Properties>
+        <Configuration>
+          <Expression>[quantity] &gt; 5</Expression>
+        </Configuration>
+      </Properties>
+      <Annotation DefaultAnnotationText="high_volume_orders"/>
+    </Node>
+    <Node ToolID="3">
+      <GuiSettings Plugin="AlteryxBasePluginsGui.Formula.Formula">
+        <Position x="350" y="54"/>
+      </GuiSettings>
+      <Properties>
+        <Configuration>
+          <FormulaFields>
+            <FormulaField field="revenue" type="Double" size="0" expression="[quantity] * [unit_price]"/>
+            <FormulaField field="bulk_tier" type="V_String" size="20" expression="IIF([quantity] &gt; 10, &quot;bulk&quot;, &quot;standard&quot;)"/>
+          </FormulaFields>
+        </Configuration>
+      </Properties>
+      <Annotation DefaultAnnotationText="orders_with_revenue"/>
+    </Node>
+    <Node ToolID="4">
+      <GuiSettings Plugin="AlteryxBasePluginsGui.Summarize.Summarize">
+        <Position x="500" y="54"/>
+      </GuiSettings>
+      <Properties>
+        <Configuration>
+          <SummarizeFields>
+            <SummarizeField field="region" action="GroupBy"/>
+            <SummarizeField field="revenue" action="Sum" rename="total_revenue"/>
+            <SummarizeField field="quantity" action="Sum" rename="total_quantity"/>
+          </SummarizeFields>
+        </Configuration>
+      </Properties>
+      <Annotation DefaultAnnotationText="region_summary"/>
+    </Node>
+    <Node ToolID="5">
+      <GuiSettings Plugin="AlteryxBasePluginsGui.DbFileOutput.DbFileOutput">
+        <Position x="650" y="54"/>
+      </GuiSettings>
+      <Properties>
+        <Configuration>
+          <File>/tmp/alteryx-test/region_summary.csv</File>
+        </Configuration>
+      </Properties>
+      <Annotation DefaultAnnotationText="output_csv"/>
+    </Node>
+  </Nodes>
+  <Connections>
+    <Connection>
+      <Origin ToolID="1" Connection="Output"/>
+      <Destination ToolID="2" Connection="Input"/>
+    </Connection>
+    <Connection>
+      <Origin ToolID="2" Connection="True"/>
+      <Destination ToolID="3" Connection="Input"/>
+    </Connection>
+    <Connection>
+      <Origin ToolID="3" Connection="Output"/>
+      <Destination ToolID="4" Connection="Input"/>
+    </Connection>
+    <Connection>
+      <Origin ToolID="4" Connection="Output"/>
+      <Destination ToolID="5" Connection="Input"/>
+    </Connection>
+  </Connections>
+</AlteryxDocument>

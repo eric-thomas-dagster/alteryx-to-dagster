@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alteryx-to-dagster"
+version = "0.1.0"
+description = "Convert Alteryx workflows (.yxmd / .yxmz / .yxzp) into Dagster projects, using the community components registry as the transform vocabulary."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Eric Thomas" }]
+keywords = ["alteryx", "dagster", "migration", "etl", "workflow", "import"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+]
+dependencies = [
+    "click>=8.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# v1.5 (LLM-assisted Formula translation). Doesn't ship by default —
+# v1 is fully offline, deterministic-only.
+llm = [
+    "litellm>=1.30.0",
+]
+
+[project.scripts]
+alteryx-to-dagster = "alteryx_to_dagster.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/eric-thomas-dagster/alteryx-to-dagster"
+"Component registry" = "https://dagster-component-ui.vercel.app/"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alteryx_to_dagster"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/alteryx_to_dagster/samples" = "alteryx_to_dagster/samples"
