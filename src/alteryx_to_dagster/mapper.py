@@ -457,12 +457,69 @@ def _map_join(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
                 join_fields_l.append(l)
             if r:
                 join_fields_r.append(r)
+    left_key = upstreams[0] if upstreams else ""
+    right_key = upstreams[1] if len(upstreams) > 1 else ""
+
+    # Self-join detection: when both sides reference the same upstream
+    # asset, Dagster's ins= dict collapses into a single entry which the
+    # dataframe_join compute_fn can't unpack into left+right cleanly.
+    # Emit an inline @dg.asset .py that does `df.merge(df, ...)` with
+    # Alteryx's "Right_<col>" column-naming convention on the right side.
+    if left_key and right_key and left_key == right_key:
+        asset_name = _asset_name_for(node)
+        l_on_repr = repr(join_fields_l)
+        r_on_repr = repr(join_fields_r)
+        # Alteryx prefixes ALL right-side columns with "Right_" (not just
+        # collisions). Pre-rename the right copy of the DataFrame so the
+        # merged output has Right_<col> columns matching what downstream
+        # Alteryx formulas / filters reference.
+        py = f'''"""Alteryx Self-Join (tool {node.tool_id}) — both inputs reference {left_key!r}.
+
+Emitted as inline pandas because Dagster's `ins=` dict requires distinct
+asset_keys per input slot; pandas .merge(df, df) is fine with the same
+underlying frame on both sides.
+
+Right-side columns are prefixed with "Right_" to match Alteryx's
+self-join column-naming convention (downstream Formula / Filter tools
+reference Right_<col>).
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({left_key!r}))}},
+    description="Alteryx Self-Join (tool {node.tool_id}) — inner merge on {join_fields_l}.",
+)
+def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
+    left = upstream
+    right = upstream.rename(columns=lambda c: f"Right_{{c}}")
+    return left.merge(
+        right,
+        left_on={l_on_repr},
+        right_on=[f"Right_{{c}}" for c in {r_on_repr}],
+        how="inner",
+    )
+'''
+        return MappedTool(
+            component_id="(inline_python)",
+            asset_name=asset_name,
+            inline_python=py,
+            notes=[
+                f"Join on tool {node.tool_id}: SELF-JOIN detected (both inputs "
+                f"are {left_key!r}). Emitted as inline pandas .merge(df, df) "
+                "with right-side columns prefixed 'Right_' to match Alteryx convention."
+            ],
+        )
+
     return MappedTool(
         component_id="dataframe_join",
         asset_name=_asset_name_for(node),
         attributes={
-            "left_asset_key": upstreams[0] if upstreams else "",
-            "right_asset_key": upstreams[1] if len(upstreams) > 1 else "",
+            "left_asset_key": left_key,
+            "right_asset_key": right_key,
             "left_on": join_fields_l,
             "right_on": join_fields_r,
             "how": "inner",
@@ -1993,21 +2050,46 @@ def _map_multi_field_formula(node: AlteryxNode, upstreams: List[str], translator
 
 
 def _map_generate_rows(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Generate Rows → `generate_rows` registry component.
+    """Alteryx Generate Rows → `generate_rows` registry component OR an
+    `inline_dataframe` when there's no upstream (Alteryx GenerateRows can
+    run rootless — generate N rows from nothing).
 
-    Common case: append a counter per input row. The component's
-    `mode=from_start` + `n=1` matches that. For Alteryx setups with a
-    non-default UpdateExpression / Condition, the emitted defs.yaml needs
-    a tweak — surface in MIGRATION.md notes.
+    Common cases:
+    - Upstream present: append a counter per input row (`mode=from_start`).
+    - No upstream: emit an inline_dataframe with N rows seeded from the
+      configured field name (one column, sequential integers).
     """
     cfg = node.config
     field_el = _find_first(cfg, "CreateField_Name", "Field", "FieldName")
     field_name = (field_el.text or "rownum").strip() if field_el is not None and field_el.text else "rownum"
+
+    upstream = _single_upstream(upstreams)
+    if not upstream:
+        # Rootless GenerateRows — emit inline_dataframe seeded with 10
+        # sequential rows. User adjusts row count + start value in defs.yaml.
+        return MappedTool(
+            component_id="inline_dataframe",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "asset_name": _asset_name_for(node),
+                "columns": [field_name],
+                "rows": [[i] for i in range(10)],
+                "group_name": "alteryx_imported",
+                "description": f"Alteryx GenerateRows (tool {node.tool_id}) — rootless; 10-row seed",
+            },
+            notes=[
+                f"GenerateRows on tool {node.tool_id}: NO upstream input in the "
+                "Alteryx workflow — emitted as inline_dataframe with 10 sequential "
+                f"integer rows in column {field_name!r}. Edit `rows:` in defs.yaml "
+                "to match your Alteryx workflow's intended range."
+            ],
+        )
+
     return MappedTool(
         component_id="generate_rows",
         asset_name=_asset_name_for(node),
         attributes={
-            "upstream_asset_key": _single_upstream(upstreams),
+            "upstream_asset_key": upstream,
             "mode": "from_start",
             "n": 1,
             "group_name": "alteryx_imported",
