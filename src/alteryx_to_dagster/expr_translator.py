@@ -627,8 +627,16 @@ def _find_next_alteryx_call(expr: str, *, exclude: set) -> Optional[Tuple[str, i
         open_paren = m.end() - 1
         depth = 0
         end = None
+        in_str: Optional[str] = None
         for i in range(open_paren, len(expr)):
             ch = expr[i]
+            if in_str is not None:
+                if ch == in_str and (i == 0 or expr[i - 1] != "\\"):
+                    in_str = None
+                continue
+            if ch in ('"', "'"):
+                in_str = ch
+                continue
             if ch == "(":
                 depth += 1
             elif ch == ")":
