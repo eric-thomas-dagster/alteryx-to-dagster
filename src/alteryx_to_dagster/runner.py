@@ -202,7 +202,9 @@ def _topo_sort(wf: AlteryxWorkflow) -> List[AlteryxNode]:
     by_id = wf.by_id()
     while queue:
         # Stable order: lowest tool_id first.
-        queue.sort(key=lambda n: int(n.tool_id) if n.tool_id.isdigit() else n.tool_id)
+        # Mixed pure-digit + prefixed tool_ids (after macro splicing) can't be
+        # compared raw — bucket by isdigit, then by numeric/string within bucket.
+        queue.sort(key=lambda n: (0, int(n.tool_id)) if n.tool_id.isdigit() else (1, n.tool_id))
         node = queue.pop(0)
         order.append(node)
         for e in wf.downstreams_of(node.tool_id):

@@ -204,18 +204,28 @@ def _resolve_macro_path(node: AlteryxNode, source_dir: Path) -> Optional[Path]:
     Looks up the raw macro reference from EngineSettings (the parser
     stashed it on the synthetic plugin string suffix), then tries:
       1. The literal path (if absolute and exists).
-      2. source_dir / raw (works for relative refs alongside the workflow).
-      3. source_dir / basename(raw) (works when the .yxmc was relocated next to the .yxmd).
-      4. source_dir / "macros" / basename(raw) (Alteryx's user-macros default subdir).
+      2. source_dir / raw (relative refs alongside the workflow).
+      3. source_dir / basename(raw) (when the .yxmc was relocated next to the .yxmd).
+      4. source_dir / "macros" / basename(raw) (Alteryx user-macros default subdir).
+      5. source_dir / "Macro" / basename(raw) (Alteryx .yxzp bundle convention).
+      6. Recursive search anywhere under source_dir for a same-basename .yxmc
+         (handles arbitrary nesting in bundled packages).
+
+    Path normalization: Alteryx XML uses Windows backslashes (`Macro\X.yxmc`)
+    even on macOS bundles, so we normalize separators before each candidate.
     """
     macro_ref = node.plugin[len(MACRO_PLUGIN_PREFIX):]  # raw filename, mixed case
     if not macro_ref:
         return None
+    # Normalize Windows backslashes → forward slashes for cross-platform path math.
+    macro_ref_norm = macro_ref.replace("\\", "/")
+    basename = Path(macro_ref_norm).name
     candidates = [
-        Path(macro_ref),
-        source_dir / macro_ref,
-        source_dir / Path(macro_ref).name,
-        source_dir / "macros" / Path(macro_ref).name,
+        Path(macro_ref_norm),
+        source_dir / macro_ref_norm,
+        source_dir / basename,
+        source_dir / "macros" / basename,
+        source_dir / "Macro" / basename,
     ]
     for c in candidates:
         try:
@@ -223,4 +233,12 @@ def _resolve_macro_path(node: AlteryxNode, source_dir: Path) -> Optional[Path]:
                 return c
         except OSError:
             continue
+    # Fallback: recursive search by basename. Works for .yxzp bundles whose
+    # macros live in arbitrary subdirs.
+    try:
+        for found in source_dir.rglob(basename):
+            if found.is_file() and found.suffix.lower() == ".yxmc":
+                return found
+    except OSError:
+        pass
     return None

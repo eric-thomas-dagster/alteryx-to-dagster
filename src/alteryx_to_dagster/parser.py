@@ -103,20 +103,28 @@ def parse_workflow(path: str | Path) -> AlteryxWorkflow:
     bundled_data_files: List[str] = []
     bundled_macros: List[str] = []
 
+    # When the source is a .yxzp / .yxmz, extract the contents to a stable
+    # temp directory so the macro splicer can resolve bundled .yxmc files
+    # and downstream code can read bundled .yxdb / supporting CSVs. The
+    # parsed workflow's `source_dir` points at the extracted root.
+    extracted_root: Optional[Path] = None
     if ext in (".yxmz", ".yxzp"):
+        import tempfile
+        extracted_root = Path(tempfile.mkdtemp(prefix=f"yxzp_{p.stem}_"))
         with zipfile.ZipFile(p) as z:
+            z.extractall(extracted_root)
             members = z.namelist()
             yxmd_members = [n for n in members if n.lower().endswith(".yxmd")]
             if not yxmd_members:
                 raise ValueError(f"{p} ({ext}) bundle contains no .yxmd inside.")
             # Prefer the shallowest .yxmd (Alteryx convention for the root workflow).
             yxmd_members.sort(key=lambda n: (n.count("/"), n))
-            with z.open(yxmd_members[0]) as f:
-                xml_bytes = f.read()
-            # Inventory anything else worth flagging.
             bundled_data_files = [n for n in members if n.lower().endswith(".yxdb")]
             bundled_macros = [n for n in members if n.lower().endswith(".yxmc")]
-        tree = ET.parse(io.BytesIO(xml_bytes))
+        # Parse the .yxmd from the extracted location so any relative path
+        # references (e.g. Macro\foo.yxmc) resolve against the bundle root.
+        extracted_yxmd = extracted_root / yxmd_members[0]
+        tree = ET.parse(extracted_yxmd)
     else:
         tree = ET.parse(p)
 
@@ -124,7 +132,10 @@ def parse_workflow(path: str | Path) -> AlteryxWorkflow:
     wf = _from_root(root)
     wf.bundled_data_files = bundled_data_files
     wf.bundled_macros = bundled_macros
-    wf.source_dir = p.parent if p.exists() else None
+    if extracted_root is not None:
+        wf.source_dir = extracted_root
+    else:
+        wf.source_dir = p.parent if p.exists() else None
     return wf
 
 
