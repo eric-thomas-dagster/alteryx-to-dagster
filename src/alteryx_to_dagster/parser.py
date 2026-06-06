@@ -114,9 +114,15 @@ def parse_workflow(path: str | Path) -> AlteryxWorkflow:
         with zipfile.ZipFile(p) as z:
             z.extractall(extracted_root)
             members = z.namelist()
-            yxmd_members = [n for n in members if n.lower().endswith(".yxmd")]
+            # Accept .yxmd (workflow), .yxwz (Alteryx App — same XML root),
+            # and .yxmc (macro — also same shape). The parser doesn't care
+            # which root it's parsing; the downstream graph code handles
+            # each tool generically.
+            yxmd_members = [n for n in members if n.lower().endswith((".yxmd", ".yxwz", ".yxmc"))]
             if not yxmd_members:
-                raise ValueError(f"{p} ({ext}) bundle contains no .yxmd inside.")
+                raise ValueError(
+                    f"{p} ({ext}) bundle contains no .yxmd / .yxwz / .yxmc inside."
+                )
             # Prefer the shallowest .yxmd (Alteryx convention for the root workflow).
             yxmd_members.sort(key=lambda n: (n.count("/"), n))
             bundled_data_files = [n for n in members if n.lower().endswith(".yxdb")]
@@ -142,44 +148,33 @@ def parse_workflow(path: str | Path) -> AlteryxWorkflow:
 def _from_root(root: ET.Element) -> AlteryxWorkflow:
     wf = AlteryxWorkflow(yxmd_version=root.attrib.get("yxmdVer", "unknown"))
 
-    nodes_el = root.find("Nodes")
-    if nodes_el is not None:
-        for node_el in nodes_el.findall("Node"):
-            tool_id = node_el.attrib.get("ToolID", "")
-            gui = node_el.find("GuiSettings")
-            plugin = (gui.attrib.get("Plugin", "") if gui is not None else "")
-
-            # Detect macro references — Alteryx stores them on
-            # <EngineSettings Macro="path/to/something.yxmc"/>. The Plugin
-            # attribute is typically empty for these, since the macro itself
-            # provides the implementation. Synthesize a sentinel plugin
-            # string so the mapper can route to either macro-splicing or
-            # stock-macro components.
-            if not plugin:
-                eng = node_el.find("EngineSettings")
-                if eng is not None:
-                    macro_ref = eng.attrib.get("Macro") or ""
-                    if macro_ref:
-                        plugin = f"AlteryxMacro::{macro_ref}"
-
-            pos_el = gui.find("Position") if gui is not None else None
-            position = {
-                "x": float(pos_el.attrib.get("x", 0)) if pos_el is not None else 0.0,
-                "y": float(pos_el.attrib.get("y", 0)) if pos_el is not None else 0.0,
-            }
-
-            ann_el = node_el.find("Annotation")
-            annotation = (
-                ann_el.attrib.get("DefaultAnnotationText")
-                if ann_el is not None
-                else None
-            )
-            # Configuration lives under <Properties><Configuration>.
-            props_el = node_el.find("Properties")
-            cfg_el = props_el.find("Configuration") if props_el is not None else None
-            if cfg_el is None:
-                cfg_el = ET.Element("Configuration")  # empty placeholder
-
+    def _add_node(node_el: ET.Element) -> None:
+        """Append a single <Node> to wf.nodes (recursing into ChildNodes)."""
+        tool_id = node_el.attrib.get("ToolID", "")
+        gui = node_el.find("GuiSettings")
+        plugin = (gui.attrib.get("Plugin", "") if gui is not None else "")
+        if not plugin:
+            eng = node_el.find("EngineSettings")
+            if eng is not None:
+                macro_ref = eng.attrib.get("Macro") or ""
+                if macro_ref:
+                    plugin = f"AlteryxMacro::{macro_ref}"
+        pos_el = gui.find("Position") if gui is not None else None
+        position = {
+            "x": float(pos_el.attrib.get("x", 0)) if pos_el is not None else 0.0,
+            "y": float(pos_el.attrib.get("y", 0)) if pos_el is not None else 0.0,
+        }
+        ann_el = node_el.find("Annotation")
+        annotation = (
+            ann_el.attrib.get("DefaultAnnotationText")
+            if ann_el is not None
+            else None
+        )
+        props_el = node_el.find("Properties")
+        cfg_el = props_el.find("Configuration") if props_el is not None else None
+        if cfg_el is None:
+            cfg_el = ET.Element("Configuration")
+        if tool_id:
             wf.nodes.append(AlteryxNode(
                 tool_id=tool_id,
                 plugin=plugin,
@@ -187,6 +182,17 @@ def _from_root(root: ET.Element) -> AlteryxWorkflow:
                 config=cfg_el,
                 position=position,
             ))
+        # Alteryx Tool Containers + Apps nest inner tools under <ChildNodes>.
+        # Recurse so we capture the inner workflow's compute tools — without
+        # this we'd only see the container shell and miss everything inside.
+        for child_container in node_el.findall("ChildNodes"):
+            for sub in child_container.findall("Node"):
+                _add_node(sub)
+
+    nodes_el = root.find("Nodes")
+    if nodes_el is not None:
+        for node_el in nodes_el.findall("Node"):
+            _add_node(node_el)
 
     conns_el = root.find("Connections")
     if conns_el is not None:

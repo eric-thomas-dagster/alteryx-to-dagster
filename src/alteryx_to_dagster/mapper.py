@@ -2862,6 +2862,129 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
             ],
         )
     ),
+    "PortfolioPluginsGui.ComposerTable.PortfolioComposerTable": (
+        # Portfolio Composer Table is typically a mid-chain styling step in a
+        # multi-section report — the data still flows downstream into a final
+        # Composer Render. Emit as a passthrough so downstream Joins/Unions
+        # consume the upstream DataFrame; the table-styling is captured as
+        # a MIGRATION.md note for the user to re-apply at the final render.
+        lambda node, upstreams: MappedTool(
+            component_id="select_columns",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Portfolio Composer Table on tool {node.tool_id}: emitted as "
+                "passthrough — table-styling has no Dagster-native equivalent "
+                "mid-chain. Wire the table render into the terminal pdf_report "
+                "(set template='template_html' with a custom HTML template for "
+                "Alteryx-style styled tables)."
+            ],
+        )
+    ),
+    "AlteryxBasePluginsGui.DynamicSelect.DynamicSelect": (
+        # DynamicSelect picks columns by type or by a formula on the column
+        # NAME. We can't deterministically pre-compute which cols match
+        # (depends on runtime dtypes), so emit a passthrough select_columns
+        # with the original Mode/Expression in a note. User refines in YAML.
+        lambda node, upstreams: (lambda mode_el, expr_el, types_el: MappedTool(
+            component_id="select_columns",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"DynamicSelect on tool {node.tool_id}: Alteryx mode="
+                f"{((mode_el.text or '').strip() if mode_el is not None and mode_el.text else 'unknown')!r}, "
+                f"expression={((expr_el.text or '').strip() if expr_el is not None and expr_el.text else '')!r}, "
+                f"field_types={((types_el.text or '').strip() if types_el is not None and types_el.text else '')!r}. "
+                "Emitted as passthrough select_columns — set `columns:` / "
+                "`drop_columns:` in defs.yaml once you know the upstream's "
+                "runtime dtype / column-name set."
+            ],
+        ))(node.config.find("Mode"), node.config.find("Expression"), node.config.find("FieldTypes"))
+    ),
+    "PlotlyCharting": (
+        # Plotly Charting tool — emits a chart spec as metadata, passes
+        # the upstream DataFrame through. Downstream tools still get the data.
+        lambda node, upstreams: MappedTool(
+            component_id="select_columns",  # passthrough
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_name": "alteryx_imported",
+                "description": (
+                    f"Alteryx Plotly Chart (tool {node.tool_id}): "
+                    "passthrough today; chart spec recorded in MIGRATION.md note. "
+                    "For interactive charting in Dagster, build a Plotly figure in "
+                    "a separate asset that consumes this one + emit it as "
+                    "MetadataValue.json(fig.to_json())."
+                ),
+            },
+            notes=[
+                f"PlotlyCharting on tool {node.tool_id}: passthrough emitted "
+                "(downstream tools see the upstream DataFrame unchanged). "
+                "Move the Plotly trace config into a Dagster asset that emits "
+                "MetadataValue.json / MetadataValue.md for inline rendering."
+            ],
+        )
+    ),
+    "AlteryxBasePluginsGui.JupyterCode.JupyterCode": (
+        # JupyterCode runs Python (formerly via Alteryx Notebooks). Emit as
+        # an inline @dg.asset that exec()s the embedded code in a scope
+        # where the upstream DataFrame is `df`.
+        lambda node, upstreams: (lambda code_el, upstream_name=(_single_upstream(upstreams) or "upstream"): MappedTool(
+            component_id="(inline_python)",
+            asset_name=_asset_name_for(node),
+            inline_python=(
+                f'"""Alteryx JupyterCode (tool {node.tool_id}) — embedded Python run "\n'
+                f'against the upstream DataFrame as `df`."""\n'
+                f'import dagster as dg\n'
+                f'import pandas as pd\n'
+                f'import numpy as np\n\n\n'
+                f'@dg.asset(\n'
+                f'    name={_asset_name_for(node)!r},\n'
+                f'    group_name="alteryx_imported",\n'
+                f'    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream_name!r}))}},\n'
+                f'    description="Alteryx JupyterCode (tool {node.tool_id})",\n'
+                f')\n'
+                f'def {_asset_name_for(node)}(upstream: pd.DataFrame) -> pd.DataFrame:\n'
+                f'    df = upstream\n'
+                f'    # Original Alteryx JupyterCode body (see MIGRATION.md notes):\n'
+                f'    # ' + ("\n    # ".join((code_el.text or "").splitlines()[:30]) if code_el is not None and code_el.text else "(no embedded code captured)") + "\n"
+                f'    # Replace this passthrough with the translated logic.\n'
+                f'    return df\n'
+            ),
+            notes=[
+                f"JupyterCode on tool {node.tool_id}: embedded Python passed "
+                "through as an inline @dg.asset stub. The Alteryx notebook's "
+                "code body is preserved as a comment block — port the logic "
+                "by hand, or wrap with dagstermill for native Jupyter execution."
+            ],
+        ))(node.config.find("Code") or node.config.find("Script") or node.config.find("NotebookSource"))
+    ),
+    "PortfolioPluginsGui.ComposerText.PortfolioComposerText": (
+        # Same reasoning as ComposerTable — text sections are mid-chain
+        # styling, not terminal output. Emit as passthrough so downstream
+        # Join/Union still receives a DataFrame.
+        lambda node, upstreams: MappedTool(
+            component_id="select_columns",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Portfolio Composer Text on tool {node.tool_id}: emitted as "
+                "passthrough — Alteryx-style headline-text report sections "
+                "have no Dagster-native equivalent. Re-attach text content "
+                "to the terminal pdf_report's html_template."
+            ],
+        )
+    ),
     "AlteryxBasePluginsGui.DynamicRename.DynamicRename": (
         # DynamicRename → dynamic_rename (NEW registry component).
         # Alteryx <RenameMode> values map to dynamic_rename modes:
@@ -3301,6 +3424,57 @@ _CONTROL_FLOW_PLUGINS = {
     "AlteryxGuiToolkit.Detour.DetourEnd": (
         "Detour End — companion to the Detour tool. Drop after wiring up "
         "the Detour's downstream AutomationCondition."
+    ),
+    "AlteryxGuiToolkit.Action.Action": (
+        "Action — Alteryx App machinery that mutates the workflow when a "
+        "Question is answered. No runtime semantic outside the App; "
+        "drop after wiring the equivalent Dagster config / partition logic."
+    ),
+    "AlteryxGuiToolkit.Questions.Tab.Tab": (
+        "Tab — Alteryx App interface tool. No data flow; purely visual "
+        "grouping inside the App's question pane. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.CheckBoxGroup.CheckBoxGroup": (
+        "CheckBoxGroup — Alteryx App interface control. Becomes a Dagster "
+        "config schema or partition-key list if you need user-driven runs. "
+        "No data flow; drop and wire equivalent config."
+    ),
+    "AlteryxGuiToolkit.Questions.NumericUpDown.NumericUpDown": (
+        "NumericUpDown — Alteryx App numeric input. Becomes a Dagster "
+        "config field or run-config var. Drop and wire equivalent config."
+    ),
+    "AlteryxGuiToolkit.Questions.Label.Label": (
+        "Label — annotation only inside an Alteryx App. No data flow; drop."
+    ),
+    "AlteryxGuiToolkit.Questions.ControlParam.ControlParam": (
+        "Control Parameter — Alteryx App input used by Macros. No data flow; "
+        "becomes a Dagster config field at the macro boundary. Drop."
+    ),
+    "AlteryxBasePluginsGui.MacroOutput.MacroOutput": (
+        "Macro Output — marks the output anchor of a custom .yxmc. The macro "
+        "splicer wires this to the parent workflow; no standalone Dagster "
+        "asset needed."
+    ),
+    "AlteryxReportChartGui.AlteryxReportChartGui": (
+        "Interactive Chart — Alteryx's HTML-report-builder chart. No runtime "
+        "data semantic; Dagster surfaces asset previews + materialization "
+        "metadata natively. Drop, or move chart logic into a notebook asset."
+    ),
+    "AlteryxBasePluginsGui.ReportHeader.ReportHeader": (
+        "Report Header — annotation only inside an Alteryx report. Drop."
+    ),
+    "AlteryxSpatialPluginsGui.ReportMap.ReportMap": (
+        "Report Map — Alteryx's spatial map renderer for the HTML report. "
+        "Drop, or replace with a Plotly / Folium map in a notebook asset."
+    ),
+    "PortfolioPluginsGui.ComposerLayout.PortfolioComposerLayout": (
+        "Portfolio Composer Layout — page-layout grouping for a multi-section "
+        "report. Children (Table / Text / Image) emit individual pdf_report "
+        "assets today; combining them into one PDF is a future enhancement."
+    ),
+    "PortfolioPluginsGui.ComposerOverlay.Overlay": (
+        "Portfolio Composer Overlay — stacks report sections. Drop or "
+        "replace with the pdf_report template_html mode for full layout."
     ),
 }
 
