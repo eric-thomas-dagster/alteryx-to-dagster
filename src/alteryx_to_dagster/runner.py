@@ -35,10 +35,11 @@ _RENAME_ATTR_RE = __import__("re").compile(r"\brename=\"([^\"]+)\"")
 _EXPRESSION_ATTR_RE = __import__("re").compile(r"\bexpression=\"([^\"]+)\"")
 _NAME_ATTR_RE = __import__("re").compile(r"\bname=\"([^\"]+)\"")
 # Tools like FindReplace store column refs as element TEXT, not attributes —
-# e.g. <FieldFind>find</FieldFind> / <FieldSearch>value</FieldSearch>.
-# Match any <SomeFieldName>text</SomeFieldName> where the tag ends in "Field".
+# e.g. <FieldFind>find</FieldFind> / <InputFieldName>Date</InputFieldName>.
+# Match any single-line element whose tag contains "Field" or "Name" or
+# "Column" — the text content is the column name.
 _FIELD_ELEMENT_RE = __import__("re").compile(
-    r"<(?:[A-Z][a-zA-Z]*Field|Field)>([^<\n]{1,80})</",
+    r"<([A-Za-z]*(?:Field|Name|Column)[A-Za-z]*)>([^<\n]{1,80})</",
 )
 
 
@@ -67,9 +68,10 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> list
         cols.update(_FIELD2_ATTR_RE.findall(cfg_text))
         cols.update(_EXPRESSION_ATTR_RE.findall(cfg_text))
         cols.update(_RENAME_ATTR_RE.findall(cfg_text))
-        # Element-text patterns (FindReplace, JSON Parse, XMLParse — these
-        # store column refs as <SomeField>colname</SomeField>, not field=).
-        cols.update(_FIELD_ELEMENT_RE.findall(cfg_text))
+        # Element-text patterns: <InputFieldName>Date</InputFieldName>,
+        # <FieldFind>find</FieldFind>, <DateColumn>created_at</DateColumn>.
+        # findall returns (tag, text) tuples — take the text only.
+        cols.update(text for _tag, text in _FIELD_ELEMENT_RE.findall(cfg_text))
         # Don't walk Field name="..." for tools that DEFINE columns (TextInput).
         # Recurse into THIS node's own downstreams (transitively).
         stack.extend(e.dest_tool for e in wf.downstreams_of(tid))

@@ -911,12 +911,10 @@ def _translate_alteryx_format(fmt: str) -> str:
 
 
 def _map_datetime_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx DateTime tool: parse a string column into a datetime column,
-    OR format a datetime column into a string column. Emit as inline pandas
-    (`pd.to_datetime` or `.dt.strftime`).
+    """Alteryx DateTime tool → `datetime_parser` registry component.
 
-    Alteryx tool config: <IsFrom> = "DateTime" (parse) or "String" (format),
-    <Field>, <Format>, <NewField>.
+    Handles both directions (parse string → datetime, format datetime → string)
+    by setting input_format or output_format as appropriate.
     """
     cfg = node.config
     field_el = cfg.find("InputFieldName") or cfg.find("Field")
@@ -929,18 +927,51 @@ def _map_datetime_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     fmt = _translate_alteryx_format(raw_fmt)
     direction = (direction_el.text or "DateTime").strip() if direction_el is not None and direction_el.text else "DateTime"
 
+    attrs: Dict[str, object] = {
+        "upstream_asset_key": _single_upstream(upstreams),
+        "date_column": field_name,
+        "output_column": new_field,
+        "group_name": "alteryx_imported",
+    }
+    if direction.lower().startswith("string"):
+        # datetime → formatted string
+        attrs["output_format"] = fmt
+    else:
+        # string → datetime
+        attrs["input_format"] = fmt
+
+    return MappedTool(
+        component_id="datetime_parser",
+        asset_name=_asset_name_for(node),
+        attributes=attrs,
+        notes=[
+            f"DateTime on tool {node.tool_id}: Alteryx format codes are "
+            "translated to Python strftime (yyyy→%Y, MM→%m, etc.). Spot-check "
+            "format string if the column doesn't parse as expected."
+        ],
+    )
+
+
+def _map_datetime_tool_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Old inline-python implementation; kept for reference, NOT registered."""
+    cfg = node.config
+    field_el = cfg.find("InputFieldName") or cfg.find("Field")
+    new_el = cfg.find("OutputFieldName") or cfg.find("NewField")
+    fmt_el = cfg.find("Format")
+    direction_el = cfg.find("IsFrom")
+    field_name = (field_el.text or "Date").strip() if field_el is not None and field_el.text else "Date"
+    new_field = (new_el.text or f"{field_name}_Out").strip() if new_el is not None and new_el.text else f"{field_name}_Out"
+    raw_fmt = (fmt_el.text or "%Y-%m-%d").strip() if fmt_el is not None and fmt_el.text else "%Y-%m-%d"
+    fmt = _translate_alteryx_format(raw_fmt)
+    direction = (direction_el.text or "DateTime").strip() if direction_el is not None and direction_el.text else "DateTime"
     upstream = _single_upstream(upstreams)
     asset_name = _asset_name_for(node)
-
     if direction.lower().startswith("string"):
-        # Format datetime → string
         body = f'    df[{new_field!r}] = df[{field_name!r}].dt.strftime({fmt!r})'
-        descr = f"DateTime format ({field_name} → {new_field}, format={fmt})"
+        descr = f"DateTime format ({field_name} -> {new_field}, format={fmt})"
     else:
-        # Parse string → datetime (default)
         body = f'    df[{new_field!r}] = pd.to_datetime(df[{field_name!r}], format={fmt!r}, errors="coerce")'
-        descr = f"DateTime parse ({field_name} → {new_field}, format={fmt})"
-
+        descr = f"DateTime parse ({field_name} -> {new_field}, format={fmt})"
     py = f'''"""Alteryx DateTime tool (tool {node.tool_id}) — inline pandas.
 
 {descr}. The Alteryx format-spec characters mostly match Python's strftime
@@ -974,23 +1005,75 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_regex_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Regex tool: Parse / Replace / Match / Tokenize via a regex pattern.
+    """Alteryx Regex tool → `regex_parser` registry component.
 
-    Config:
-      <Method>     "Parse" / "Replace" / "Match" / "Tokenize"
-      <Field>      input column
-      <Pattern>    regex pattern
-      <NewField>   output column (for Replace / Match)
-      <Replace>    replacement string (for Replace)
-      <CaseSensitive>
+    Mode map: Parse → extract, Replace → replace, Match → match,
+    Tokenize → split (component's `mode=split` handles split-into-rows).
     """
+    cfg = node.config
+    field_el = cfg.find("Field")
+    # Alteryx stores the regex in <RegExExpression value="..."/> as an
+    # ATTRIBUTE (not element text), with <Pattern>x</Pattern> as a fallback.
+    regex_attr_el = cfg.find("RegExExpression")
+    pattern_el = cfg.find("Pattern")
+    method_el = cfg.find("Method")
+    new_el = cfg.find("NewField")
+    # <Replace expression="..."/> — replacement is on the attribute.
+    repl_attr_el = cfg.find("Replace")
+    field_name = (field_el.text or "Field").strip() if field_el is not None and field_el.text else "Field"
+    if regex_attr_el is not None and "value" in regex_attr_el.attrib:
+        pattern = regex_attr_el.attrib["value"]
+    elif pattern_el is not None and pattern_el.text:
+        pattern = pattern_el.text.strip()
+    else:
+        pattern = ".*"  # safe build-time default; tool was misconfigured
+    method = (method_el.text or "Replace").strip() if method_el is not None and method_el.text else "Replace"
+    new_field = (new_el.text or f"{field_name}_Out").strip() if new_el is not None and new_el.text else f"{field_name}_Out"
+    replacement = ""
+    if repl_attr_el is not None:
+        replacement = repl_attr_el.attrib.get("expression", "")
+        if not replacement and repl_attr_el.text:
+            replacement = repl_attr_el.text.strip()
+
+    # ParseComplex == multi-group capture (extract); ParseSimple == split.
+    # Map Alteryx's method names onto regex_parser's mode field.
+    mode_map = {
+        "parse": "extract",
+        "parsecomplex": "extract",
+        "parsesimple": "split",
+        "replace": "replace",
+        "match": "match",
+        "tokenize": "split",
+    }
+    mode = mode_map.get(method.lower(), "extract")
+
+    attrs: Dict[str, object] = {
+        "upstream_asset_key": _single_upstream(upstreams),
+        "column": field_name,
+        "pattern": pattern,
+        "mode": mode,
+        "group_name": "alteryx_imported",
+    }
+    if mode == "replace":
+        attrs["replacement"] = replacement
+        attrs["output_column"] = new_field
+    elif mode in ("match", "extract"):
+        attrs["output_column"] = new_field
+    return MappedTool(
+        component_id="regex_parser",
+        asset_name=_asset_name_for(node),
+        attributes=attrs,
+    )
+
+
+def _map_regex_tool_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Old inline impl — NOT registered."""
     cfg = node.config
     field_el = cfg.find("Field")
     pattern_el = cfg.find("Pattern")
     method_el = cfg.find("Method")
     new_el = cfg.find("NewField")
     repl_el = cfg.find("Replace")
-
     field_name = (field_el.text or "Field").strip() if field_el is not None and field_el.text else "Field"
     pattern = (pattern_el.text or "").strip() if pattern_el is not None and pattern_el.text else ""
     method = (method_el.text or "Replace").strip() if method_el is not None and method_el.text else "Replace"
@@ -1053,7 +1136,19 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_json_parse(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx JSON Parse → pd.json_normalize."""
+    """Alteryx JSON Parse → `json_flatten` registry component."""
+    return MappedTool(
+        component_id="json_flatten",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "group_name": "alteryx_imported",
+        },
+    )
+
+
+def _map_json_parse_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Old inline impl — NOT registered."""
     cfg = node.config
     field_el = cfg.find("Field")
     field_name = (field_el.text or "JSON_Name").strip() if field_el is not None and field_el.text else "JSON_Name"
@@ -1096,13 +1191,36 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_xml_parse(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx XML Parse → inline pandas (lxml-based) extraction.
+    """Alteryx XML Parse → `xml_parser` registry component.
 
-    Alteryx supports XPath-style extraction with output rules per child.
-    We emit a small handler that uses xml.etree to extract child-element
-    text; users with more complex needs (attributes, namespaces) should
-    tweak.
+    Alteryx config doesn't include xpath_expressions (it auto-extracts
+    direct children); emit an empty dict — the user fills in per-column
+    xpaths in the defs.yaml.
     """
+    cfg = node.config
+    field_el = cfg.find("Field")
+    field_name = (field_el.text or "XML").strip() if field_el is not None and field_el.text else "XML"
+    return MappedTool(
+        component_id="xml_parser",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "xml_column": field_name,
+            "xpath_expressions": {},
+            "group_name": "alteryx_imported",
+        },
+        notes=[
+            f"XMLParse on tool {node.tool_id}: emitted with empty "
+            "`xpath_expressions`. The Alteryx tool auto-extracts direct child "
+            "elements; for the registry's xml_parser you need to specify "
+            "explicit xpath_expressions like `{out_col: '//Tag/text()'}` in "
+            "the emitted defs.yaml."
+        ],
+    )
+
+
+def _map_xml_parse_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Old inline impl — NOT registered."""
     cfg = node.config
     field_el = cfg.find("Field")
     field_name = (field_el.text or "XML").strip() if field_el is not None and field_el.text else "XML"
@@ -1159,11 +1277,31 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_text_to_columns(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Text To Columns → inline pandas `.str.split()` expansion.
+    """Alteryx Text To Columns → `text_to_columns` registry component."""
+    cfg = node.config
+    field_el = cfg.find("Field")
+    delim_el = cfg.find("Delimeters") or cfg.find("Delimiters")
+    cols_el = cfg.find("NumFields") or cfg.find("NumColumns")
+    field_name = (field_el.text or "Field1").strip() if field_el is not None and field_el.text else "Field1"
+    delim = (delim_el.text or ",").strip() if delim_el is not None and delim_el.text else ","
+    n_cols = int(cols_el.text) if cols_el is not None and cols_el.text and cols_el.text.isdigit() else None
+    attrs: Dict[str, object] = {
+        "upstream_asset_key": _single_upstream(upstreams),
+        "column": field_name,
+        "separator": delim,
+        "group_name": "alteryx_imported",
+    }
+    if n_cols:
+        attrs["max_splits"] = n_cols - 1
+    return MappedTool(
+        component_id="text_to_columns",
+        asset_name=_asset_name_for(node),
+        attributes=attrs,
+    )
 
-    No 1:1 registry component; emit as a small @dg.asset .py so the
-    expansion stays deterministic.
-    """
+
+def _map_text_to_columns_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Old inline impl — NOT registered."""
     field_el = node.config.find("Field")
     delim_el = node.config.find("Delimeters") or node.config.find("Delimiters")
     cols_el = node.config.find("NumFields") or node.config.find("NumColumns")
@@ -1209,11 +1347,55 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_data_cleansing(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Data Cleansing → inline pandas (strip whitespace + case + null fill).
+    """Alteryx Data Cleansing → `data_cleansing` registry component.
 
-    Reads the standard config flags (TrimWhitespace, RemoveTabs, ReplaceNullsString,
-    ReplaceNullsNumeric, ChangeCase, etc.) and emits a deterministic .py asset.
+    Reads the Alteryx flag XML (TrimWhitespace, ReplaceNullsString, ChangeCase)
+    and maps to the component's pydantic fields.
     """
+    cfg = node.config
+
+    def _flag(name: str) -> bool:
+        el = cfg.find(name)
+        if el is None:
+            return False
+        v = (el.text or "").strip().lower() if el.text else (el.attrib.get("value", "") or "").lower()
+        return v in ("true", "1", "yes")
+
+    trim_ws = _flag("TrimWhitespace") or _flag("RemoveTabs") or _flag("RemoveDuplicateWhitespace")
+    fill_str = _flag("ReplaceNullsString")
+    fill_num = _flag("ReplaceNullsNumeric")
+    case_el = cfg.find("ChangeCase")
+    case_op = (case_el.text or "").strip().lower() if case_el is not None and case_el.text else ""
+
+    attrs: Dict[str, object] = {
+        "upstream_asset_key": _single_upstream(upstreams),
+        "group_name": "alteryx_imported",
+    }
+    if trim_ws:
+        attrs["trim_whitespace"] = True
+    if fill_str or fill_num:
+        attrs["null_handling"] = "fill"
+        if fill_str:
+            attrs["null_fill_value"] = ""
+        # Numeric fill (0) is handled automatically by the registry component
+        # when null_fill_value is None — but we set "" above for the string side.
+        # That means numeric NaN stays as NaN in this branch (an Alteryx quirk
+        # where you can independently toggle string vs numeric).
+    if case_op == "upper":
+        attrs["normalize_case"] = "upper"
+    elif case_op == "lower":
+        attrs["normalize_case"] = "lower"
+    elif case_op == "title":
+        attrs["normalize_case"] = "title"
+    return MappedTool(
+        component_id="data_cleansing",
+        asset_name=_asset_name_for(node),
+        attributes=attrs,
+    )
+
+
+def _map_data_cleansing_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Old inline impl — NOT registered."""
     cfg = node.config
     asset_name = _asset_name_for(node)
     upstream = _single_upstream(upstreams)
@@ -1377,7 +1559,45 @@ def {asset_name}({args_decl}) -> pd.DataFrame:
 
 
 def _map_tile(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Tile → inline pandas pd.qcut / pd.cut for bucket assignment."""
+    """Alteryx Tile → `tile_binning` registry component.
+
+    Alteryx supports several tile methods; we map EqualRecords →
+    `equal_records` (quantile-based) and everything else → `equal_width`.
+    Component's `method` field also accepts `manual_cutoffs` and
+    `smart_quantile` for advanced cases — surfaced in MIGRATION.md.
+    """
+    cfg = node.config
+    method_el = cfg.find("Method")
+    field_el = cfg.find("Field")
+    num_el = cfg.find("NumTiles")
+    out_field = cfg.find("OutputField")
+    method_a = (method_el.text or "EqualRecords").strip() if method_el is not None and method_el.text else "EqualRecords"
+    field_name = (field_el.text or "value").strip() if field_el is not None and field_el.text else "value"
+    n_tiles = int(num_el.text) if num_el is not None and num_el.text and num_el.text.isdigit() else 4
+    out_col = (out_field.text or "Tile_Num").strip() if out_field is not None and out_field.text else "Tile_Num"
+    method_b = "equal_records" if "Records" in method_a else "equal_width"
+    return MappedTool(
+        component_id="tile_binning",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "column": field_name,
+            "n_bins": n_tiles,
+            "method": method_b,
+            "output_column": out_col,
+            "group_name": "alteryx_imported",
+        },
+        notes=[
+            f"Tile on tool {node.tool_id}: Alteryx method={method_a!r} → "
+            f"`tile_binning` method={method_b!r}. EqualSums / SmartTile / "
+            "ManualCutoffs need the component's manual_cutoffs or "
+            "smart_quantile mode — edit the emitted defs.yaml if needed."
+        ],
+    )
+
+
+def _map_tile_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Old inline impl — NOT registered."""
     cfg = node.config
     asset_name = _asset_name_for(node)
     upstream = _single_upstream(upstreams)
@@ -1432,79 +1652,48 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_sample(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Sample → either the `sample` component (Random / 1-in-N modes)
-    or an inline @dg.asset .py using pandas `.head(n)` / `.tail(n)` / `.iloc[::n]`
-    for the FirstN / LastN / EveryNth modes, since the `sample` component is
-    random-only and there's no head/tail component in the registry yet.
+    """Alteryx Sample → `sample` registry component.
 
-    Maps faithfully — Alteryx's FirstN is deterministic, not a random sample,
-    so we can't silently substitute random sampling there.
+    The component's `method` field handles random / head / tail / every_nth /
+    skip_head. Alteryx's mode names map cleanly: First→head, Last→tail,
+    EveryNth→every_nth, Random→random, 1-in-N→random+frac, Skip→skip_head.
     """
     mode_el = node.config.find("Mode")
     n_el = node.config.find("N")
     mode = (mode_el.text or "First").strip() if mode_el is not None else "First"
     n = int(n_el.text) if n_el is not None and n_el.text and n_el.text.isdigit() else 1
-    asset_name = _asset_name_for(node)
-    upstream = _single_upstream(upstreams)
-    mode_lower = mode.lower().replace("n", "")  # "firstn" → "first", "lastn" → "last"
+    mode_lower = mode.lower().replace("n", "")  # "firstn" -> "first"
 
+    attrs: Dict[str, object] = {
+        "upstream_asset_key": _single_upstream(upstreams),
+        "group_name": "alteryx_imported",
+    }
     if mode_lower in ("first", ""):
-        body = f"    return upstream.head({n})"
-        descr = f"Alteryx Sample FirstN={n}"
+        attrs["method"] = "head"
+        attrs["sample_size"] = n
     elif mode_lower == "last":
-        body = f"    return upstream.tail({n})"
-        descr = f"Alteryx Sample LastN={n}"
+        attrs["method"] = "tail"
+        attrs["sample_size"] = n
     elif mode_lower in ("everynth", "every"):
-        body = f"    return upstream.iloc[::{n}].copy()"
-        descr = f"Alteryx Sample EveryNth={n}"
+        attrs["method"] = "every_nth"
+        attrs["sample_size"] = n
+    elif mode_lower in ("skip", "skipfirst"):
+        attrs["method"] = "skip_head"
+        attrs["sample_size"] = n
     elif mode_lower in ("random", "randomn"):
-        # Faithful to a random sample — use the `sample` component.
-        return MappedTool(
-            component_id="sample",
-            asset_name=asset_name,
-            attributes={
-                "upstream_asset_key": upstream,
-                "sample_size": n,
-                "group_name": "alteryx_imported",
-            },
-        )
+        attrs["method"] = "random"
+        attrs["sample_size"] = n
     elif mode_lower in ("1in", "1innn"):
-        return MappedTool(
-            component_id="sample",
-            asset_name=asset_name,
-            attributes={
-                "upstream_asset_key": upstream,
-                "frac": 1.0 / max(n, 1),
-                "group_name": "alteryx_imported",
-            },
-        )
+        attrs["method"] = "random"
+        attrs["frac"] = 1.0 / max(n, 1)
     else:
-        body = f"    return upstream.head({n})  # unknown Alteryx Sample mode {mode!r}, defaulting to head"
-        descr = f"Alteryx Sample (mode={mode}, fallback to head)"
-
-    py = f'''"""Alteryx Sample (tool {node.tool_id}) — emitted as inline pandas.
-
-The registry's `sample` component is random-only; Alteryx's FirstN /
-LastN / EveryNth are deterministic, so we use pandas .head/.tail/.iloc
-directly. Fully deterministic at runtime.
-"""
-import dagster as dg
-import pandas as pd
-
-
-@dg.asset(
-    name={asset_name!r},
-    group_name="alteryx_imported",
-    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
-    description="{descr}",
-)
-def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
-{body}
-'''
+        # Unknown — default to head; note in MIGRATION.md.
+        attrs["method"] = "head"
+        attrs["sample_size"] = n
     return MappedTool(
-        component_id="(inline_python)",
-        asset_name=asset_name,
-        inline_python=py,
+        component_id="sample",
+        asset_name=_asset_name_for(node),
+        attributes=attrs,
     )
 
 
@@ -1657,19 +1846,26 @@ def _map_transpose(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     if data_has_wildcard:
         # Signal to unpivot: "use all non-id columns" by passing None.
         data_fields = []
+    # pd.melt rejects var_name / value_name that match an existing column.
+    # Pick defaults unlikely to collide — "Name" and "Value" are super-common
+    # column names; "Variable" + "MeltedValue" are safer.
     return MappedTool(
         component_id="unpivot",
         asset_name=_asset_name_for(node),
         attributes={
             "upstream_asset_key": _single_upstream(upstreams),
-            # Registry's UnpivotComponent uses id_columns / value_columns
-            # (pandas-style id_vars / value_vars renamed for component clarity).
             "id_columns": key_fields,
             "value_columns": data_fields or None,
-            "var_name": "Name",
-            "value_name": "Value",
+            "var_name": "Variable",
+            "value_name": "MeltedValue",
             "group_name": "alteryx_imported",
         },
+        notes=[
+            f"Transpose on tool {node.tool_id}: emitted with var_name='Variable' "
+            "and value_name='MeltedValue' to avoid collisions with common "
+            "column names. Alteryx's defaults are 'Name' / 'Value' — rename "
+            "if downstream tools expect those exact column names."
+        ],
     )
 
 
@@ -1753,104 +1949,57 @@ def _map_multi_field_formula(node: AlteryxNode, upstreams: List[str], translator
 
 
 def _map_generate_rows(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Generate Rows → inline pandas counter column.
+    """Alteryx Generate Rows → `generate_rows` registry component.
 
-    Alteryx's GenerateRows takes (Field, InitialValue, Condition, UpdateExpression)
-    and emits N rows applying UpdateExpression until Condition fails. The
-    common case is "increment a counter" — we handle that natively; more
-    complex update expressions fall back to a literal Python loop.
+    Common case: append a counter per input row. The component's
+    `mode=from_start` + `n=1` matches that. For Alteryx setups with a
+    non-default UpdateExpression / Condition, the emitted defs.yaml needs
+    a tweak — surface in MIGRATION.md notes.
     """
     cfg = node.config
-    asset_name = _asset_name_for(node)
-    upstream = _single_upstream(upstreams)
-
-    # The real Alteryx XML carries this in <CreateField_Name>; older flows
-    # used <Field> or <FieldName>. Fall back through all three.
     field_el = cfg.find("CreateField_Name") or cfg.find("Field") or cfg.find("FieldName")
-    init_el = cfg.find("InitialValue") or cfg.find("Initial")
     field_name = (field_el.text or "rownum").strip() if field_el is not None and field_el.text else "rownum"
-    init_val_raw = (init_el.text or "0").strip() if init_el is not None and init_el.text else "0"
-    try:
-        init_val = int(init_val_raw)
-    except ValueError:
-        try:
-            init_val = float(init_val_raw)  # noqa: F841
-        except ValueError:
-            init_val = 0
-
-    py = f'''"""Alteryx Generate Rows (tool {node.tool_id}) — appends a counter column."""
-import dagster as dg
-import pandas as pd
-
-
-@dg.asset(
-    name={asset_name!r},
-    group_name="alteryx_imported",
-    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream!r}))}},
-    description="Alteryx Generate Rows (tool {node.tool_id}, field={field_name}).",
-)
-def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
-    df = upstream.copy()
-    df[{field_name!r}] = range({init_val}, {init_val} + len(df))
-    return df
-'''
     return MappedTool(
-        component_id="(inline_python)",
-        asset_name=asset_name,
-        inline_python=py,
+        component_id="generate_rows",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "mode": "from_start",
+            "n": 1,
+            "group_name": "alteryx_imported",
+        },
+        notes=[
+            f"GenerateRows on tool {node.tool_id}: emitted with mode='from_start' (one new row per input row). "
+            f"Original Alteryx field was {field_name!r}; adjust the emitted defs.yaml if your "
+            "Alteryx workflow used a custom condition or update expression."
+        ],
     )
 
 
 def _map_find_replace(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Find Replace → inline pandas df.replace().
+    """Alteryx Find Replace → `find_replace` registry component.
 
-    Two inputs in Alteryx: source (the rows to edit) and find/replace
-    pairs (a separate DataFrame). We honor the configured FieldFind /
-    FieldReplace / FieldSearch columns.
+    Two inputs: main (the rows being edited) + lookup (find/replace pairs).
+    FieldFind / FieldReplace / FieldSearch elements name the columns.
     """
     cfg = node.config
-    asset_name = _asset_name_for(node)
-
     find_field_el = cfg.find("FieldFind")
     replace_field_el = cfg.find("FieldReplace")
     search_field_el = cfg.find("FieldSearch")
     find_field = (find_field_el.text or "find").strip() if find_field_el is not None and find_field_el.text else "find"
     replace_field = (replace_field_el.text or "replace").strip() if replace_field_el is not None and replace_field_el.text else "replace"
     search_field = (search_field_el.text or "value").strip() if search_field_el is not None and search_field_el.text else "value"
-
-    source_key = upstreams[0] if upstreams else ""
-    lookup_key = upstreams[1] if len(upstreams) > 1 else ""
-
-    py = f'''"""Alteryx Find Replace (tool {node.tool_id}) — inline df.replace()."""
-import dagster as dg
-import pandas as pd
-
-
-@dg.asset(
-    name={asset_name!r},
-    group_name="alteryx_imported",
-    ins={{
-        "source": dg.AssetIn(key=dg.AssetKey({source_key!r})),
-        "lookup": dg.AssetIn(key=dg.AssetKey({lookup_key!r})),
-    }},
-    description="Alteryx Find Replace (tool {node.tool_id}): replace {search_field!r} values using {find_field!r}→{replace_field!r} lookup.",
-)
-def {asset_name}(source: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
-    df = source.copy()
-    mapping = dict(zip(lookup[{find_field!r}], lookup[{replace_field!r}]))
-    df[{search_field!r}] = df[{search_field!r}].replace(mapping)
-    return df
-'''
     return MappedTool(
-        component_id="(inline_python)",
-        asset_name=asset_name,
-        inline_python=py,
-        notes=[
-            f"FindReplace on tool {node.tool_id}: full-cell replace only "
-            "(matches Alteryx's default Match Whole Word). For substring "
-            "match, swap `df[col].replace(mapping)` for "
-            "`df[col].str.replace(...)` per row."
-        ],
+        component_id="find_replace",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": upstreams[0] if upstreams else "",
+            "lookup_asset_key": upstreams[1] if len(upstreams) > 1 else "",
+            "lookup_key_column": find_field,
+            "lookup_value_column": replace_field,
+            "target_column": search_field,
+            "group_name": "alteryx_imported",
+        },
     )
 
 
