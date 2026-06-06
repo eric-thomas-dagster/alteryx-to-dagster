@@ -294,6 +294,9 @@ _OPERATOR_REPLACEMENTS = [
     (re.compile(r"\bAND\b", re.IGNORECASE), "&"),
     (re.compile(r"\bOR\b", re.IGNORECASE), "|"),
     (re.compile(r"\bNOT\b", re.IGNORECASE), "~"),
+    # Alteryx `!` prefix (boolean NOT) → pandas `~` (Series NOT). Must NOT
+    # touch `!=` (not-equal). Lookahead asserts the next char is not `=`.
+    (re.compile(r"!(?!=)"), "~"),
 ]
 
 

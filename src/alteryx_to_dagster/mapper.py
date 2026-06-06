@@ -2139,8 +2139,11 @@ def _map_find_replace(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 def _map_create_points(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Alteryx Create Points → `points_from_latlon` registry component.
 
-    Alteryx config: `<Fields fieldX="lon_col" fieldY="lat_col"/>`. We map
-    to the registry's PointsFromLatLonComponent.
+    Alteryx config: `<Fields fieldX="lon_col" fieldY="lat_col"/>`. Output
+    column defaults to `Centroid` (Alteryx's hardcoded convention — not
+    configurable in the tool UI). Downstream Alteryx tools reference
+    "Centroid", so we emit `geometry_column: "Centroid"` to keep the chain
+    intact.
     """
     cfg = node.config
     fields_el = cfg.find("Fields")
@@ -2157,7 +2160,7 @@ def _map_create_points(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
             "upstream_asset_key": _single_upstream(upstreams),
             "longitude_column": lon_col,
             "latitude_column": lat_col,
-            "geometry_column": "geometry",
+            "geometry_column": "Centroid",  # Alteryx CreatePoints default
             "crs": "EPSG:4326",
             "group_name": "alteryx_imported",
         },
@@ -2398,7 +2401,11 @@ def _map_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
                     unknown_selected = True
                 continue
             if selected:
-                keep.append(rename or fn)
+                # Always append the ORIGINAL field name to `columns:` — the
+                # registry's select_columns applies `columns:` (keep filter)
+                # BEFORE `rename:`, so the original name must be in the
+                # keep-list for the rename to actually fire on it.
+                keep.append(fn)
                 if rename and rename != fn:
                     rename_map[fn] = rename
             else:
@@ -2764,7 +2771,7 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
             asset_name=_asset_name_for(node),
             attributes={
                 "upstream_asset_key": _single_upstream(upstreams),
-                "geometry_column": "geometry",
+                "geometry_column": "Centroid",  # match Alteryx CreatePoints default
                 "metrics": ["area", "length", "centroid", "bounds", "geom_type"],
                 "area_unit": "sq_miles",
                 "length_unit": "miles",
@@ -2806,7 +2813,7 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
                 "upstream_asset_key": _single_upstream(upstreams),
                 "drive_minutes": 15,
                 "provider": "openrouteservice",
-                "geometry_column": "geometry",
+                "geometry_column": "Centroid",  # match Alteryx CreatePoints default
                 "group_name": "alteryx_imported",
             },
             notes=[
