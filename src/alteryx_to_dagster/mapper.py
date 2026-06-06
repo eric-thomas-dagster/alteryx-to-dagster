@@ -555,12 +555,20 @@ def _map_input_csv(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
     elif ext in ("xlsx", "xls"):
         # Use the registry's polymorphic file_ingestion source component —
         # it handles Excel natively (and CSV / Parquet / JSON / etc. via
-        # format=auto on the extension). Stored sheet_name from the
-        # Alteryx `|||Sheet$` suffix flows through to read_excel().
+        # format=auto on the extension).
         component_id = "file_ingestion"
         extra_attrs["format"] = "excel"
+        # file_ingestion.read_excel reads the first sheet by default; it
+        # doesn't accept sheet_name. If Alteryx pointed at a specific sheet
+        # via `|||Sheet$` suffix, surface it as a note for the user.
         if sheet_name:
-            extra_attrs["sheet_name"] = sheet_name
+            notes.append(
+                f"Input Data on tool {node.tool_id}: Alteryx targeted Excel sheet "
+                f"{sheet_name!r}. `file_ingestion` reads the first sheet — to read "
+                "the original sheet, save it as the first sheet OR replace this "
+                "component with an inline @dg.asset using "
+                "`pd.read_excel(path, sheet_name=...)`."
+            )
     elif ext == "yxdb":
         component_id = "dataframe_from_yxdb"
     else:
@@ -1561,14 +1569,15 @@ def _map_running_total(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 
 
 def _map_append_fields(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Append Fields → cartesian product. The component takes a
-    Target (the bigger input) + a Source (the field-list to broadcast)."""
+    """Alteryx Append Fields → cartesian product. The component's actual
+    field names are `upstream_asset_key` (Target = big input) and
+    `source_asset_key` (Source = small DataFrame whose columns broadcast)."""
     return MappedTool(
         component_id="append_fields",
         asset_name=_asset_name_for(node),
         attributes={
-            "upstream_asset_key_target": upstreams[0] if upstreams else "",
-            "upstream_asset_key_source": upstreams[1] if len(upstreams) > 1 else "",
+            "upstream_asset_key": upstreams[0] if upstreams else "",
+            "source_asset_key": upstreams[1] if len(upstreams) > 1 else "",
             "group_name": "alteryx_imported",
         },
         notes=[

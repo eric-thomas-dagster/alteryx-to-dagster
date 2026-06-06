@@ -87,17 +87,15 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> list
 
 
 def _stub_value_literal_for(col: str) -> str:
-    """Pick a Python literal value for a stub-row column based on the
-    column name. Returns a string that can be embedded directly in `repr`.
+    """Pick a Python literal for a stub-row column based on the column name.
 
-    Heuristic order:
-      1. Date-ish names → ISO date string
-      2. Lat / Lon → float
-      3. Anything that contains a numeric-sounding token (count, area, sq,
-         distance, pct, %, etc.) → 1 (an int that survives both
-         multiplication AND division as the right-hand side; 0 would cause
-         downstream divide-by-zero crashes in pct/ratio calcs)
-      4. Default → empty string
+    Mixed: columns whose names strongly suggest numeric use get an int
+    (so arithmetic works); columns whose names suggest text get a string
+    (so `.str.X` ops work). Date-like names get an ISO timestamp.
+
+    Defaulting non-matches to strings keeps `.str.X` happy at the cost of
+    arithmetic on the few non-named-numeric columns that ARE numeric;
+    we surface this in MIGRATION.md.
     """
     n = col.lower()
     if "date" in n or "time" in n or "_at" in n:
@@ -106,19 +104,25 @@ def _stub_value_literal_for(col: str) -> str:
         return "0.0"
     if "lon" in n or "lng" in n:
         return "0.0"
+    # Numeric-hinted names → int. Word-boundary match (suffix `_id` should
+    # count, but bare "id" inside `width` shouldn't).
     numeric_hints = (
-        "count", "qty", "quantity", "amount", "price", "id", "num", "score",
-        "rate", "total", "sum", "rank", "area", "sqmi", "sqkm", "sqft",
+        "count", "qty", "quantity", "amount", "price", "_id", "id_",
+        "num", "score", "rate", "total", "sum", "rank",
+        "area", "sqmi", "sqkm", "sqft",
         "distance", "miles", "km", "feet", "pct", "percent", "ratio",
-        "avg", "mean", "min", "max", "median", "stddev", "var",
-        "win", "lost", "loss", "lock", "size", "len", "length",
+        "avg", "mean", "median", "stddev",
+        "win", "lost", "loss", "size", "length",
         "year", "month", "day", "hour", "minute", "second",
-        "salary", "revenue", "profit", "loss", "cost", "value",
+        "salary", "revenue", "profit", "cost",
+        "lock",  # used in formula tests
     )
     if any(t in n for t in numeric_hints):
-        # `1` not `0` so downstream `x / area` doesn't divide-by-zero.
         return "1"
-    return '""'
+    # Default → empty-ish string so `.str.X` works. NOT `""` because
+    # pd.DataFrame(["", ...]) keeps as object but downstream pd.to_numeric
+    # produces NaN; "x" keeps as object AND coerces to NaN cleanly.
+    return '"x"'
 
 
 def _topo_sort(wf: AlteryxWorkflow) -> List[AlteryxNode]:
@@ -393,24 +397,53 @@ def _emit_local_path_warning(mapped_results, files_written, out_dir: Path) -> No
 
     md = out_dir / "CLOUD_PORTABILITY.md"
     body = (
-        "# Cloud-portability notice\n\n"
+        "# Cloud-portability notice — read before deploying to Dagster+ Cloud\n\n"
         "The imported project references **local filesystem paths** in one or "
         "more emitted assets. Local paths work for `dg dev` on your laptop, "
-        "but break the moment the project deploys anywhere else — Dagster+ "
-        "Hybrid / Serverless, Kubernetes, a CI runner — because none of those "
-        "environments share your laptop's filesystem.\n\n"
-        "**Recommended fix**: copy the referenced files (or their converted "
-        "equivalents — Parquet is usually the right swap for .yxdb / .csv) into "
-        "cloud object storage and update `file_path` in each defs.yaml:\n\n"
-        "| Cloud | URL shape |\n"
-        "|---|---|\n"
-        "| AWS S3 | `s3://my-bucket/alteryx-exports/customers.parquet` |\n"
-        "| Google Cloud Storage | `gs://my-bucket/alteryx-exports/customers.parquet` |\n"
-        "| Azure Blob | `abfs://container@account.dfs.core.windows.net/path/file.parquet` |\n"
-        "| Snowflake stage | `@MY_STAGE/path/customers.parquet` (via `sql_transform`) |\n\n"
-        "Most `dataframe_from_*` components accept the same URL forms pandas "
-        "/ pyarrow do, so the swap is usually one line per asset.\n\n"
-        "## Local paths detected in this import\n\n"
+        "but break the moment the project deploys anywhere else.\n\n"
+        "## What won't work in Dagster+ Cloud / Hybrid / Serverless\n\n"
+        "These patterns FAIL the second the project leaves your laptop:\n\n"
+        "1. **Absolute Windows paths** (`C:\\Users\\...`) — Dagster+ runners "
+        "are Linux containers; the C:\\ drive doesn't exist.\n"
+        "2. **Absolute POSIX paths to user / Downloads / Desktop dirs** "
+        "(`/Users/<you>/Downloads/file.csv`, `~/data/file.xlsx`) — runner "
+        "containers don't have your home directory mounted.\n"
+        "3. **Relative paths assuming a current-working-dir** "
+        "(`./data/file.csv`) — Dagster+ runs aren't guaranteed to start "
+        "in your project root.\n"
+        "4. **Local SQLite / DuckDB files** (`file.db`, `file.duckdb`) — "
+        "ephemeral container filesystems get wiped between runs; data is lost.\n"
+        "5. **Bundled .yxdb files** in your .yxzp / .yxmz package — the "
+        "Alteryx binary format isn't accessible from the running container "
+        "unless you copy it to cloud storage first.\n"
+        "6. **Local Excel/CSV files referenced by their absolute laptop path** "
+        "(this notice is firing because we detected one of these).\n\n"
+        "## Recommended fix — cloud object storage URLs\n\n"
+        "Copy each referenced file (or its converted equivalent — Parquet is "
+        "usually the right swap for .yxdb / .csv on size+speed grounds) into "
+        "cloud object storage, then update `file_path` in each defs.yaml:\n\n"
+        "| Cloud | URL shape | Components that accept it |\n"
+        "|---|---|---|\n"
+        "| AWS S3 | `s3://my-bucket/alteryx-exports/customers.parquet` | `dataframe_from_*`, `file_ingestion` |\n"
+        "| Google Cloud Storage | `gs://my-bucket/alteryx-exports/customers.parquet` | `dataframe_from_*`, `file_ingestion` |\n"
+        "| Azure Blob | `abfs://container@account.dfs.core.windows.net/path/file.parquet` | `dataframe_from_*`, `file_ingestion` |\n"
+        "| Snowflake stage | `@MY_STAGE/path/customers.parquet` | via `sql_transform` / `warehouse_pipeline` |\n"
+        "| Databricks Unity Catalog | `abfss://container@account.dfs.core.windows.net/path` | `dataframe_from_*` |\n\n"
+        "Most `dataframe_from_*` and `file_ingestion` components accept the "
+        "same URL forms pandas / pyarrow / fsspec do, so the swap is usually "
+        "one `file_path:` line per asset.\n\n"
+        "## Dagster+ Cloud specifics\n\n"
+        "- Use **Dagster+ Resources** (the `Resources` tab in the UI) to bind "
+        "cloud credentials at deploy time — never hard-code AWS_ACCESS_KEY / "
+        "GCP service-account JSON in defs.yaml.\n"
+        "- For per-environment config (dev/staging/prod buckets), use "
+        "`from_run_config:` on `file_ingestion` and supply the URL via a "
+        "sensor / schedule's `RunConfig` at materialization time.\n"
+        "- For files >100 MB, set the asset's `compute_kind: warehouse` and "
+        "route through `sql_transform` / `warehouse_pipeline` against your "
+        "Snowflake / BigQuery / Redshift cluster instead of pulling into "
+        "pandas — Dagster+ Serverless workers have memory limits.\n\n"
+        "## Local paths we detected in this import\n\n"
     )
     body += "\n".join(sorted(set(found_paths))) + "\n"
     md.write_text(body)
