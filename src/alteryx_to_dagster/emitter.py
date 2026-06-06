@@ -90,6 +90,7 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "address_standardize": "AddressStandardizeComponent",
     "r_script": "RScriptComponent",
     "jupyter_notebook": "JupyterNotebookComponent",
+    "automation_condition_applicator": "AutomationConditionApplicatorComponent",
     # Predictive — sklearn-backed registry components (with model_path joblib save)
     "linear_regression_model": "LinearRegressionModelComponent",
     "logistic_regression_model": "LogisticRegressionModelComponent",
@@ -137,8 +138,18 @@ def emit_yaml(
     # asset_name lives on MappedTool (and is what we used to pick the folder
     # name above) but most components also require it as an attribute. Merge
     # it in unless the caller already supplied one in `attributes`.
+    # Exception: infrastructure components that don't materialize a single
+    # asset (automation_condition_applicator) don't have an asset_name field
+    # and pydantic rejects extras.
+    _COMPONENTS_WITHOUT_ASSET_NAME = {"automation_condition_applicator"}
     merged_attrs = dict(attributes)
-    merged_attrs.setdefault("asset_name", asset_name)
+    if component_id not in _COMPONENTS_WITHOUT_ASSET_NAME:
+        merged_attrs.setdefault("asset_name", asset_name)
+    else:
+        # Strip group_name + asset_name if accidentally passed for an
+        # infrastructure component.
+        merged_attrs.pop("asset_name", None)
+        merged_attrs.pop("group_name", None)
     # Preserve required-shape keys (upstream/left/right/asset_key etc.) even
     # when their value is "" — dropping them causes pydantic ValidationErrors
     # at component construction. An empty string is visible to the user as
