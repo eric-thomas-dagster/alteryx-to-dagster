@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from .emitter import emit_inline_python, emit_migration_report, emit_yaml
+from .indb_collapse import build_warehouse_pipelines
 from .macro_splicer import splice_macros
 from .mapper import MappedTool, UnmappedTool, _stock_macro_basenames, map_tool
 from .parser import AlteryxNode, AlteryxWorkflow, parse_workflow
@@ -274,6 +275,32 @@ def import_workflow(
     component_ids_used: List[str] = []
     files_written: List[Path] = []
 
+    # Collapse connected In-DB subgraphs into a single warehouse_pipeline asset
+    # per group BEFORE the per-tool loop, so each In-DB tool maps to the
+    # collapsed asset_name instead of its own sql_transform CTAS.
+    _indb_groups = build_warehouse_pipelines(wf)
+    _collapsed_tool_ids: set = set()
+    for _grp in _indb_groups:
+        _collapsed_tool_ids |= _grp["tool_ids"]
+        _path = emit_yaml(
+            out_root=out_dir,
+            pkg=pkg,
+            component_id="warehouse_pipeline",
+            asset_name=_grp["asset_name"],
+            attributes=_grp["attrs"],
+        )
+        files_written.append(_path)
+        component_ids_used.append("warehouse_pipeline")
+        for _tid in _grp["tool_ids"]:
+            tool_to_asset[_tid] = _grp["asset_name"]
+        mapped_results.append((
+            ",".join(sorted(_grp["tool_ids"])),
+            "AlteryxConnectorsGui.InDb*",
+            "warehouse_pipeline",
+            _grp["asset_name"],
+            [f"Collapsed {len(_grp['tool_ids'])} In-DB tools into one CTE-chain asset."],
+        ))
+
     placeholder_assets_emitted: set = set()  # tool_ids we've stubbed a source for
 
     def _emit_placeholder_source(origin_tool_id: str) -> str:
@@ -331,6 +358,12 @@ def {ph_name}() -> pd.DataFrame:
         return ph_name
 
     for node in ordered:
+        # Tools collapsed into a warehouse_pipeline group already have their
+        # asset_name set in tool_to_asset; skip the per-tool sql_transform
+        # mapping for them.
+        if node.tool_id in _collapsed_tool_ids:
+            continue
+
         # Resolve upstreams in connection-anchor order so e.g. Join's Left/Right
         # arrive deterministically.
         incoming_edges = sorted(

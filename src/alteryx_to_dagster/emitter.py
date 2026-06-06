@@ -74,6 +74,7 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "pdf_report": "PdfReportComponent",
     "dynamic_rename": "DynamicRenameComponent",
     "window_calculation": "WindowCalculationComponent",
+    "warehouse_pipeline": "WarehousePipelineComponent",
     # Spatial — new geo components from v0.5.13
     "poly_build": "PolyBuildComponent",
     "spatial_info": "SpatialInfoComponent",
