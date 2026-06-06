@@ -92,6 +92,22 @@ Two LiteLLM calls per flagged expression — translate + independent score — *
 
 Cost: ~$0.0004 per flagged expression at gpt-4o-mini. One-time per import.
 
+## What it doesn't do today
+
+Honest gaps — what won't work after import:
+
+| Category | Status |
+|---|---|
+| **In-DB chain collapse** | Per-tool mapping works (each In-DB tool emits its own `sql_transform` with intermediate CTAS). The single-query collapse into `warehouse_pipeline` (CTE chain that preserves Alteryx's pushdown semantics) is **not yet wired** — needs to be rebuilt after the registry deletion that wiped the original implementation. |
+| **Alteryx Apps** | Interface tools (Macro Input/Output / Control Parameter / Action) are skipped — these only exist for Alteryx's App/Macro UI and have no Dagster equivalent. |
+| **Reporting (Render / Layout / Email / Charting)** | Render and PortfolioComposer route to `pdf_report` for the table-style output. Email/Layout/Charting (HTML report builders) are skipped — different paradigm. |
+| **MultiRowFormula edge cases** | Pure `[Row±N:Col]` → `window_calculation`, compound IF/THEN/ELSE → `formula` with `df['Col'].shift(N)`. Expressions with nested `REGEX_Match` / function calls that don't fully deterministic-translate still need manual review (flagged in MIGRATION.md). |
+| **Browse / Tool Container / Comment / Text Box / HTMLBox** | Skipped as control-flow — purely visual in Alteryx, no runtime equivalent. Tool Container's INNER tools still get imported. |
+| **Custom data quality / lineage tools** | If your shop ships custom Alteryx tools (proprietary connectors, GIS-vendor specific tools, etc.), they land in MIGRATION.md as unmapped. The `--llm-translate` fallback can sometimes infer a translation for the formula bodies inside them. |
+| **Alteryx engine-internal nuances** | A few Alteryx semantics aren't 1:1 in pandas — e.g., Alteryx's implicit type coercion when mixing dtypes in expressions. Workflows that rely on these may need targeted fixes in the generated `defs.yaml`. |
+
+If you hit a gap not listed here, open an issue with the Alteryx XML and we'll add it.
+
 ## Validation corpus
 
 Continuously tested against the [Alteryx Weekly Challenge](https://community.alteryx.com/categories/weeklychallenge-board) workflows — 83 .yxmd files covering most tool families. Current stats:
