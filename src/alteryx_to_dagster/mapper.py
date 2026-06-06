@@ -2736,31 +2736,36 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     ),
     "AlteryxSpatialPluginsGui.PolyBuild.PolyBuild": (
         # PolyBuild → poly_build component. Alteryx config:
-        # <SequenceField> ordering within ring, <GroupField> identifies each
-        # polygon, <Field>/<XField>/<YField> for vertex coords.
-        lambda node, upstreams: MappedTool(
+        #   <SpatialObj field="X"/>   geometry column (existing Point geoms)
+        #   <GroupField field="Y"/>   group identifier
+        #   <SequenceField field="Z"/> ordering within group (often blank → row order)
+        #   <BuildType>SequencePolyline | SequencePolygon | etc.</BuildType>
+        lambda node, upstreams: (lambda spatial_el, group_el, seq_el, type_el: MappedTool(
             component_id="poly_build",
             asset_name=_asset_name_for(node),
             attributes={
                 "upstream_asset_key": _single_upstream(upstreams),
-                "group_column": (
-                    (_find_first(node.config, "GroupField", "Group", "GroupBy").text or "group")
-                    if _find_first(node.config, "GroupField", "Group", "GroupBy") is not None else "group"
-                ),
+                "group_column": (group_el.attrib.get("field") if group_el is not None else "group") or "group",
+                # SequenceField is often blank in Alteryx — None tells the
+                # component to use row order, matching Alteryx semantics.
                 "sequence_column": (
-                    (_find_first(node.config, "SequenceField", "Sequence", "Order").text or "sequence")
-                    if _find_first(node.config, "SequenceField", "Sequence", "Order") is not None else "sequence"
+                    seq_el.attrib.get("field") or None
+                ) if seq_el is not None else None,
+                "input_geometry_column": (
+                    spatial_el.attrib.get("field") if spatial_el is not None else "Centroid"
+                ) or "Centroid",
+                "output_type": (
+                    "polygon" if (type_el is not None and type_el.text and "Polygon" in type_el.text)
+                    else "line"
                 ),
-                "latitude_column": "Latitude",
-                "longitude_column": "Longitude",
-                "output_type": "polygon",
+                "geometry_column": "geometry",  # output col, separate from input
                 "group_name": "alteryx_imported",
             },
-            notes=[
-                f"PolyBuild on tool {node.tool_id}: defaults to latitude/longitude "
-                "column names — Alteryx stores them as Y/X fields, often unnamed. "
-                "Update latitude_column / longitude_column to match your data."
-            ],
+        ))(
+            node.config.find("SpatialObj"),
+            node.config.find("GroupField"),
+            node.config.find("SequenceField"),
+            node.config.find("BuildType"),
         )
     ),
     "AlteryxSpatialPluginsGui.SpatialInfo.SpatialInfo": (
