@@ -38,6 +38,22 @@ class UnmappedTool:
 _BRACKETED_FIELD = re.compile(r"\[([^\[\]]+)\]")
 
 
+def _find_first(cfg, *names):
+    """Return the first non-None element among the given tag names.
+
+    Python's `_find_first(cfg, "A", "B")` is BROKEN for ElementTree —
+    Element instances are falsy when they have no children, so a leaf
+    element like `<A>text</A>` evaluates falsy and the `or` falls through
+    to find("B"). This helper uses explicit `is not None` checks so leaf
+    elements with only text content are kept.
+    """
+    for name in names:
+        el = cfg.find(name)
+        if el is not None:
+            return el
+    return None
+
+
 def _strip_field_brackets(expr: str) -> str:
     """Alteryx wraps field refs in [Brackets]; pandas eval just uses the bare name."""
     return _BRACKETED_FIELD.sub(r"\1", expr)
@@ -706,11 +722,11 @@ def _make_indb_mapped(
 
 def _map_indb_input(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
     cfg = node.config
-    query_el = cfg.find("Query") or cfg.find("TableSelect") or cfg.find("Table")
+    query_el = _find_first(cfg, "Query", "TableSelect", "Table")
     raw_sql = (query_el.text or "").strip() if query_el is not None and query_el.text else ""
     if not raw_sql:
         # Some Alteryx In-DB Input tools store the query as a TableName attribute.
-        table_el = cfg.find("TableName") or cfg.find("Source")
+        table_el = _find_first(cfg, "TableName", "Source")
         table_name = (table_el.text or "").strip() if table_el is not None and table_el.text else "TODO_source_table"
         raw_sql = f"SELECT * FROM {table_name}"
     return _make_indb_mapped(node, raw_sql, [])
@@ -800,7 +816,7 @@ def _map_indb_union(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 
 def _map_indb_sample(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     cfg = node.config
-    n_el = cfg.find("N") or cfg.find("Records")
+    n_el = _find_first(cfg, "N", "Records")
     n = int(n_el.text) if n_el is not None and n_el.text and n_el.text.isdigit() else 100
     upstream_table = upstreams[0] if upstreams else "UPSTREAM_TABLE"
     sql = f"SELECT * FROM {upstream_table} LIMIT {n}"
@@ -811,7 +827,7 @@ def _map_indb_sample(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 def _map_indb_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     cfg = node.config
     cols = []
-    sf_el = cfg.find("SelectFields") or cfg.find("Fields")
+    sf_el = _find_first(cfg, "SelectFields", "Fields")
     if sf_el is not None:
         for f in sf_el.findall("SelectField") + sf_el.findall("Field"):
             fn = f.attrib.get("field")
@@ -836,7 +852,7 @@ def _map_indb_streamout(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 def _map_indb_writedata(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """In-DB Write Data → CTAS into a final user-specified table."""
     cfg = node.config
-    dest_el = cfg.find("TableName") or cfg.find("Destination") or cfg.find("OutputTable")
+    dest_el = _find_first(cfg, "TableName", "Destination", "OutputTable")
     dest_table = (dest_el.text or "TODO_dest_table").strip() if dest_el is not None and dest_el.text else "TODO_dest_table"
     upstream_table = upstreams[0] if upstreams else "UPSTREAM_TABLE"
     sql = f"SELECT * FROM {upstream_table}"
@@ -917,8 +933,8 @@ def _map_datetime_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     by setting input_format or output_format as appropriate.
     """
     cfg = node.config
-    field_el = cfg.find("InputFieldName") or cfg.find("Field")
-    new_el = cfg.find("OutputFieldName") or cfg.find("NewField")
+    field_el = _find_first(cfg, "InputFieldName", "Field")
+    new_el = _find_first(cfg, "OutputFieldName", "NewField")
     fmt_el = cfg.find("Format")
     direction_el = cfg.find("IsFrom")
     field_name = (field_el.text or "Date").strip() if field_el is not None and field_el.text else "Date"
@@ -955,8 +971,8 @@ def _map_datetime_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 def _map_datetime_tool_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Old inline-python implementation; kept for reference, NOT registered."""
     cfg = node.config
-    field_el = cfg.find("InputFieldName") or cfg.find("Field")
-    new_el = cfg.find("OutputFieldName") or cfg.find("NewField")
+    field_el = _find_first(cfg, "InputFieldName", "Field")
+    new_el = _find_first(cfg, "OutputFieldName", "NewField")
     fmt_el = cfg.find("Format")
     direction_el = cfg.find("IsFrom")
     field_name = (field_el.text or "Date").strip() if field_el is not None and field_el.text else "Date"
@@ -1277,14 +1293,32 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_text_to_columns(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Text To Columns → `text_to_columns` registry component."""
+    """Alteryx Text To Columns → `text_to_columns` registry component.
+
+    Alteryx names output columns `<RootName>1`, `<RootName>2`, etc., with
+    `<RootName>` defaulting to the source field name. The registry component
+    auto-generates `<column>_0`, `<column>_1` which won't match downstream
+    Alteryx-style references. Emit explicit `output_columns` to preserve.
+
+    Alteryx delimiter is on the `value=` attribute of `<Delimeters>` /
+    `<Delimiters>` (not element text). Same for `<NumFields value=N/>`.
+    """
     cfg = node.config
     field_el = cfg.find("Field")
-    delim_el = cfg.find("Delimeters") or cfg.find("Delimiters")
-    cols_el = cfg.find("NumFields") or cfg.find("NumColumns")
+    delim_el = _find_first(cfg, "Delimeters", "Delimiters")
+    cols_el = _find_first(cfg, "NumFields", "NumColumns")
+    root_el = cfg.find("RootName")
     field_name = (field_el.text or "Field1").strip() if field_el is not None and field_el.text else "Field1"
-    delim = (delim_el.text or ",").strip() if delim_el is not None and delim_el.text else ","
-    n_cols = int(cols_el.text) if cols_el is not None and cols_el.text and cols_el.text.isdigit() else None
+    delim = ","
+    if delim_el is not None:
+        delim = delim_el.attrib.get("value") or (delim_el.text or "").strip() or ","
+    n_cols = None
+    if cols_el is not None:
+        n_raw = cols_el.attrib.get("value") or (cols_el.text or "").strip()
+        if n_raw and n_raw.isdigit():
+            n_cols = int(n_raw)
+    root_name = (root_el.text or field_name).strip() if root_el is not None and root_el.text else field_name
+
     attrs: Dict[str, object] = {
         "upstream_asset_key": _single_upstream(upstreams),
         "column": field_name,
@@ -1293,6 +1327,8 @@ def _map_text_to_columns(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     }
     if n_cols:
         attrs["max_splits"] = n_cols - 1
+        # Alteryx 1-indexed convention: <root>1, <root>2, ..., <root>N.
+        attrs["output_columns"] = [f"{root_name}{i}" for i in range(1, n_cols + 1)]
     return MappedTool(
         component_id="text_to_columns",
         asset_name=_asset_name_for(node),
@@ -1303,8 +1339,8 @@ def _map_text_to_columns(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 def _map_text_to_columns_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Old inline impl — NOT registered."""
     field_el = node.config.find("Field")
-    delim_el = node.config.find("Delimeters") or node.config.find("Delimiters")
-    cols_el = node.config.find("NumFields") or node.config.find("NumColumns")
+    delim_el = _find_first(node.config, "Delimeters", "Delimiters")
+    cols_el = _find_first(node.config, "NumFields", "NumColumns")
     asset_name = _asset_name_for(node)
     upstream = _single_upstream(upstreams)
     field_name = (field_el.text or "Field1").strip() if field_el is not None else "Field1"
@@ -1501,7 +1537,7 @@ def _map_join_multiple(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """
     cfg = node.config
     asset_name = _asset_name_for(node)
-    join_field_el = cfg.find("JoinByRecordPosition") or cfg.find("JoinField")
+    join_field_el = _find_first(cfg, "JoinByRecordPosition", "JoinField")
     join_field = None
     if join_field_el is not None and join_field_el.text:
         join_field = join_field_el.text.strip()
@@ -1957,7 +1993,7 @@ def _map_generate_rows(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     a tweak — surface in MIGRATION.md notes.
     """
     cfg = node.config
-    field_el = cfg.find("CreateField_Name") or cfg.find("Field") or cfg.find("FieldName")
+    field_el = _find_first(cfg, "CreateField_Name", "Field", "FieldName")
     field_name = (field_el.text or "rownum").strip() if field_el is not None and field_el.text else "rownum"
     return MappedTool(
         component_id="generate_rows",
@@ -2041,7 +2077,7 @@ def _map_poly_split(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     cfg = node.config
     asset_name = _asset_name_for(node)
     upstream = _single_upstream(upstreams)
-    geom_el = cfg.find("GeometryField") or cfg.find("Field")
+    geom_el = _find_first(cfg, "GeometryField", "Field")
     geom_col = (geom_el.text or "geometry").strip() if geom_el is not None and geom_el.text else "geometry"
 
     py = f'''"""Alteryx Poly-Split (tool {node.tool_id}) — explode geometry to per-vertex rows."""
@@ -2164,7 +2200,7 @@ def _map_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Alteryx Select tool — keep/rename/reorder columns."""
     keep: List[str] = []
     rename_map: Dict[str, str] = {}
-    sf_el = node.config.find("SelectFields") or node.config.find("Fields")
+    sf_el = _find_first(node.config, "SelectFields", "Fields")
     if sf_el is not None:
         for f in sf_el.findall("SelectField") + sf_el.findall("Field"):
             fn = f.attrib.get("field")
