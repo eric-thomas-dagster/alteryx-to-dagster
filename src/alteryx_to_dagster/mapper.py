@@ -449,18 +449,39 @@ def _map_summarize(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 def _map_join(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     join_fields_l: List[str] = []
     join_fields_r: List[str] = []
-    jf_el = node.config.find("JoinInfo")
-    if jf_el is not None:
-        for f in jf_el.findall("Field"):
-            l = f.attrib.get("field")
-            r = f.attrib.get("field2") or l
-            # Skip Alteryx's *Unknown wildcard if Alteryx put it in JoinInfo.
+    # Alteryx joins encode keys as TWO sibling <JoinInfo> blocks —
+    # connection="Left" and connection="Right" — each with one or more
+    # <Field field="X"/> children. Read both side-by-side so cross-name
+    # joins (left "Tm" → right "Teams") get the correct right key.
+    left_info = None
+    right_info = None
+    for ji in node.config.findall("JoinInfo"):
+        conn = (ji.attrib.get("connection") or "").lower()
+        if conn == "left":
+            left_info = ji
+        elif conn == "right":
+            right_info = ji
+    if left_info is not None and right_info is not None:
+        left_fields = [f.attrib.get("field") for f in left_info.findall("Field") if f.attrib.get("field")]
+        right_fields = [f.attrib.get("field") for f in right_info.findall("Field") if f.attrib.get("field")]
+        for l, r in zip(left_fields, right_fields):
             if l == "*Unknown" or r == "*Unknown":
                 continue
-            if l:
-                join_fields_l.append(l)
-            if r:
-                join_fields_r.append(r)
+            join_fields_l.append(l)
+            join_fields_r.append(r)
+    else:
+        # Fallback: older/simpler JoinInfo blocks list both via field/field2.
+        jf_el = node.config.find("JoinInfo")
+        if jf_el is not None:
+            for f in jf_el.findall("Field"):
+                l = f.attrib.get("field")
+                r = f.attrib.get("field2") or l
+                if l == "*Unknown" or r == "*Unknown":
+                    continue
+                if l:
+                    join_fields_l.append(l)
+                if r:
+                    join_fields_r.append(r)
     left_key = upstreams[0] if upstreams else ""
     right_key = upstreams[1] if len(upstreams) > 1 else ""
 
@@ -567,7 +588,7 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
             "and Right-Unjoined anchors. The default mapping is inner-join only. "
             "If downstream tools consume the L/R anchors, you'll need additional "
             "filter assets to recreate the antijoin behaviour."
-        ] if jf_el is not None else [],
+        ] if (left_info is not None or node.config.find("JoinInfo") is not None) else [],
     )
 
 

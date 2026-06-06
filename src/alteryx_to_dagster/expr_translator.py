@@ -370,15 +370,21 @@ def _wrap_brackets_for_python(expr: str) -> str:
 
 
 def _apply_operator_replacements(expr: str) -> str:
-    """AND/OR/NOT → &/|/~. Skip replacements inside string literals."""
-    # Easier approach: walk strings, only apply replacements to non-string segments.
+    """AND/OR/NOT → &/|/~. Skip replacements inside string literals.
+
+    Post-pass: wrap each operand of `&` / `|` in parens when it contains
+    a bare comparison. Pandas / numpy bool ops have higher precedence than
+    comparisons (opposite of Python's `and`/`or`), so without parens
+    `df['A'] < df['B'] & df['C'] > df['D']` evaluates as
+    `df['A'] < (df['B'] & df['C']) > df['D']` and triggers
+    'truth value of a Series is ambiguous'.
+    """
     out = []
     buf = []
     in_str: Optional[str] = None
     for ch in expr:
         if in_str is None:
             if ch in ('"', "'"):
-                # Flush buf with replacements, then enter string.
                 seg = "".join(buf)
                 for pat, repl in _OPERATOR_REPLACEMENTS:
                     seg = pat.sub(repl, seg)
@@ -396,7 +402,77 @@ def _apply_operator_replacements(expr: str) -> str:
     for pat, repl in _OPERATOR_REPLACEMENTS:
         seg = pat.sub(repl, seg)
     out.append(seg)
-    return "".join(out)
+    return _paren_wrap_bool_operands("".join(out))
+
+
+def _paren_wrap_bool_operands(expr: str) -> str:
+    """Tokenize on top-level `&` / `|` (outside strings + balanced parens)
+    and wrap any operand containing a bare comparison operator in parens."""
+    import re as _re
+    parts: List[str] = []
+    ops: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    in_str: Optional[str] = None
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if in_str is not None:
+            buf.append(ch)
+            if ch == in_str and (i == 0 or expr[i - 1] != "\\"):
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_str = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in ")]}":
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+        if depth == 0 and ch in ("&", "|"):
+            # Skip "&&" / "||" — already paren'd or compound ops, leave alone.
+            if i + 1 < len(expr) and expr[i + 1] == ch:
+                buf.append(ch)
+                i += 1
+                continue
+            parts.append("".join(buf).strip())
+            ops.append(ch)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf).strip())
+
+    if not ops:
+        return expr
+
+    _CMP_RE = _re.compile(r"(?<![<>=!])(?:<=|>=|==|!=|<|>)(?!=)")
+
+    def _maybe_wrap(p: str) -> str:
+        p = p.strip()
+        if not p:
+            return p
+        # Already paren-wrapped?
+        if p.startswith("(") and p.endswith(")"):
+            return p
+        if _CMP_RE.search(p):
+            return f"({p})"
+        return p
+
+    result = _maybe_wrap(parts[0])
+    for op, nxt in zip(ops, parts[1:]):
+        result += f" {op} " + _maybe_wrap(nxt)
+    return result
 
 
 def _split_args(args_str: str) -> List[str]:
