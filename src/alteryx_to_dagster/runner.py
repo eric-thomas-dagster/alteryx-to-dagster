@@ -148,6 +148,10 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> tupl
     return out, str_cols, num_cols
 
 
+_PATH_HINTS = ("path", "directory", "folder", "filename", "filepath", "url", "uri",
+                "host", "server", "endpoint", "engine.")
+
+
 def _stub_value_literal_for(col: str, force_string: bool = False, force_numeric: bool = False) -> str:
     """Pick a Python literal for a stub-row column based on the column name.
 
@@ -165,6 +169,12 @@ def _stub_value_literal_for(col: str, force_string: bool = False, force_numeric:
     string (so `.str.X` ops work). Date-like names get an ISO timestamp.
     """
     n = col.lower()
+    # Path / URL / engine-var columns are ALWAYS string — override the
+    # downstream scanner's numeric heuristic. Concatenation patterns
+    # like `[Engine.WorkflowDirectory] + "style.yxdb"` look numeric to
+    # the arithmetic regex but are actually string concat.
+    if any(t in n for t in _PATH_HINTS):
+        return '"/tmp/"'
     if force_numeric and not force_string:
         return "1"
     if "date" in n or "time" in n or "_at" in n:

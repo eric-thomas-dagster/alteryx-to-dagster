@@ -65,6 +65,7 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "points_from_latlon": "PointsFromLatLonComponent",
     "drive_time": "DriveTimeComponent",
     "geo_buffer": "GeoBufferComponent",
+    "geocoder": "GeocoderComponent",
     "geo_overlay": "GeoOverlayComponent",
     "geo_simplify": "GeoSimplifyComponent",
     "pearson_correlation": "PearsonCorrelationComponent",
@@ -75,6 +76,9 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "dynamic_rename": "DynamicRenameComponent",
     "window_calculation": "WindowCalculationComponent",
     "warehouse_pipeline": "WarehousePipelineComponent",
+    "arima_forecast": "ArimaForecastComponent",
+    "ets_forecast": "EtsForecastComponent",
+    "ts_forecast": "TsForecastComponent",
     # Spatial — new geo components from v0.5.13
     "poly_build": "PolyBuildComponent",
     "spatial_info": "SpatialInfoComponent",
@@ -82,6 +86,8 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "nearest_neighbors": "NearestNeighborsComponent",
     "point_in_polygon": "PointInPolygonComponent",
     "spatial_join": "SpatialJoinComponent",
+    "spatial_process": "SpatialProcessComponent",
+    "address_standardize": "AddressStandardizeComponent",
     # Predictive — sklearn-backed registry components (with model_path joblib save)
     "linear_regression_model": "LinearRegressionModelComponent",
     "logistic_regression_model": "LogisticRegressionModelComponent",

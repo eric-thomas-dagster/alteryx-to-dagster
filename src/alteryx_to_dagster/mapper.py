@@ -2153,8 +2153,11 @@ def _map_multi_field_formula(node: AlteryxNode, upstreams: List[str], translator
         asset_name=_asset_name_for(node),
         attributes={
             "upstream_asset_key": _single_upstream(upstreams),
-            "fields": fields,
-            "expression": translated,
+            # Component's field is `columns`, not `fields` (was a naming
+            # mismatch). Provide a no-op default expression when the
+            # translation failed so the asset still validates.
+            "columns": fields,
+            "expression": translated or "{col}",
             "group_name": "alteryx_imported",
         },
         notes=notes,
@@ -2420,6 +2423,64 @@ _STOCK_MACRO_COMPONENTS: Dict[str, Any] = {
             "null_fill_value": "",
         },
     },
+    # Alteryx Predictive Tools macros — route to dedicated registry components.
+    # date_column / value_column defaults are placeholders; the user needs
+    # to edit defs.yaml to match the upstream column names.
+    "arima.yxmc": {
+        "component_id": "arima_forecast",
+        "attributes": {"forecast_periods": 12, "date_column": "date", "value_column": "value"},
+    },
+    "ets.yxmc": {
+        "component_id": "ets_forecast",
+        "attributes": {"forecast_periods": 12, "date_column": "date", "value_column": "value"},
+    },
+    "ts_forecast.yxmc": {
+        "component_id": "arima_forecast",
+        "attributes": {"forecast_periods": 12, "date_column": "date", "value_column": "value"},
+    },
+    "timeseriesfiller.yxmc": {
+        "component_id": "select_columns",  # passthrough (fills gaps inline)
+        "attributes": {},
+    },
+    "imputation_v2.yxmc": {
+        "component_id": "data_cleansing",
+        "attributes": {"null_handling": "fill", "null_fill_value": "", "trim_whitespace": False},
+    },
+    "field_summary_report.yxmc": {
+        "component_id": "select_columns",  # passthrough; profiling is metadata
+        "attributes": {},
+    },
+    "oversample_field.yxmc": {
+        "component_id": "select_columns",  # passthrough; oversample is statsmodels-shaped
+        "attributes": {},
+    },
+    "histogram.yxmc": {
+        "component_id": "select_columns",  # passthrough; histogram is a visual
+        "attributes": {},
+    },
+    # CReW community macros — common utilities; map best-effort to passthrough
+    # so the chain doesn't break.
+    "crew_expectequal.yxmc": {
+        "component_id": "select_columns",
+        "attributes": {},
+    },
+    "crew_ensurefields.yxmc": {
+        "component_id": "select_columns",
+        "attributes": {},
+    },
+    # Generic helper macros.
+    "selectrecords.yxmc": {
+        "component_id": "sample",  # SelectRecords picks first N — sample fits
+        "attributes": {"method": "head", "sample_size": 10},
+    },
+    "countrecords.yxmc": {
+        "component_id": "summarize",
+        "attributes": {"group_by": [], "aggregations": {}},  # whole-frame size
+    },
+    "weightedavg.yxmc": {
+        "component_id": "summarize",
+        "attributes": {"group_by": [], "aggregations": {}},
+    },
 }
 
 
@@ -2443,7 +2504,14 @@ def _map_alteryx_macro(node: AlteryxNode, upstreams: List[str]):
     EITHER stock OR a custom macro that couldn't be resolved.
     """
     macro_basename = node.plugin[len("AlteryxMacro::"):]
-    stock = _STOCK_MACRO_COMPONENTS.get(macro_basename.lower())
+    # Strip any path prefix (e.g. `Predictive Tools\ARIMA.yxmc` → `ARIMA.yxmc`)
+    # so the lookup matches by bare filename only. Windows backslash + POSIX
+    # forward slash both normalized.
+    _bare = macro_basename.replace("\\", "/").split("/")[-1]
+    stock = (
+        _STOCK_MACRO_COMPONENTS.get(macro_basename.lower())
+        or _STOCK_MACRO_COMPONENTS.get(_bare.lower())
+    )
     if stock:
         component_id = stock["component_id"]
         defaults = dict(stock.get("attributes") or {})  # type: ignore[arg-type]
@@ -2929,6 +2997,176 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
                 "(downstream tools see the upstream DataFrame unchanged). "
                 "Move the Plotly trace config into a Dagster asset that emits "
                 "MetadataValue.json / MetadataValue.md for inline rendering."
+            ],
+        )
+    ),
+    "AlteryxBasePluginsGui.RTool.RTool": (
+        # R Tool runs R code against the upstream DataFrame (Alteryx historically
+        # transferred via .yxdb). Emit a passthrough inline @dg.asset with the
+        # R script preserved as a comment block — user picks: rewrite in Python,
+        # or wrap with subprocess.run(["Rscript", ...]) calling rpy2.
+        lambda node, upstreams: (lambda code_el, upstream_name=(_single_upstream(upstreams) or "upstream"): MappedTool(
+            component_id="(inline_python)",
+            asset_name=_asset_name_for(node),
+            inline_python=(
+                f'"""Alteryx R Tool (tool {node.tool_id}) — port to Python or shell out to Rscript."""\n'
+                f'import dagster as dg\n'
+                f'import pandas as pd\n\n\n'
+                f'@dg.asset(\n'
+                f'    name={_asset_name_for(node)!r},\n'
+                f'    group_name="alteryx_imported",\n'
+                f'    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream_name!r}))}},\n'
+                f'    description="Alteryx R Tool (tool {node.tool_id}) — passthrough stub",\n'
+                f')\n'
+                f'def {_asset_name_for(node)}(upstream: pd.DataFrame) -> pd.DataFrame:\n'
+                f'    df = upstream\n'
+                f'    # Original R script body — port to Python (pandas / numpy / scikit-learn)\n'
+                f'    # or shell out via:\n'
+                f'    #   import subprocess; subprocess.run(["Rscript", "script.R", ...])\n'
+                f'    # or use rpy2 for in-process R from Python.\n'
+                f'    # R script was:\n'
+                f'    # ' + ("\n    # ".join((code_el.text or "").splitlines()[:30]) if code_el is not None and code_el.text else "(no embedded R script captured)") + "\n"
+                f'    return df\n'
+            ),
+            notes=[
+                f"R Tool on tool {node.tool_id}: R script preserved as comment "
+                "in inline @dg.asset. Port to Python or wrap with rpy2 / Rscript."
+            ],
+        ))(node.config.find("RCode") or node.config.find("Code") or node.config.find("Script"))
+    ),
+    "AlteryxRPluginsGui.RTool.RTool": (
+        # Alternate plugin path (newer Alteryx releases route through RPluginsGui).
+        lambda node, upstreams: (lambda code_el, upstream_name=(_single_upstream(upstreams) or "upstream"): MappedTool(
+            component_id="(inline_python)",
+            asset_name=_asset_name_for(node),
+            inline_python=(
+                f'"""Alteryx R Tool (tool {node.tool_id})."""\n'
+                f'import dagster as dg\n'
+                f'import pandas as pd\n\n\n'
+                f'@dg.asset(\n'
+                f'    name={_asset_name_for(node)!r},\n'
+                f'    group_name="alteryx_imported",\n'
+                f'    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream_name!r}))}},\n'
+                f'    description="Alteryx R Tool (tool {node.tool_id}) — passthrough stub",\n'
+                f')\n'
+                f'def {_asset_name_for(node)}(upstream: pd.DataFrame) -> pd.DataFrame:\n'
+                f'    df = upstream\n'
+                f'    # R script body (port to Python or shell out via Rscript / rpy2):\n'
+                f'    # ' + ("\n    # ".join((code_el.text or "").splitlines()[:30]) if code_el is not None and code_el.text else "(no embedded R script captured)") + "\n"
+                f'    return df\n'
+            ),
+            notes=[f"R Tool on tool {node.tool_id}: passthrough stub w/ R script preserved as comment."],
+        ))(node.config.find("RCode") or node.config.find("Code") or node.config.find("Script"))
+    ),
+    "JupyterCode": (
+        # Bare-name alias used by newer Alteryx versions.
+        lambda node, upstreams: (lambda code_el, upstream_name=(_single_upstream(upstreams) or "upstream"): MappedTool(
+            component_id="(inline_python)",
+            asset_name=_asset_name_for(node),
+            inline_python=(
+                f'"""Alteryx JupyterCode (tool {node.tool_id}) — embedded Python."""\n'
+                f'import dagster as dg\n'
+                f'import pandas as pd\n'
+                f'import numpy as np\n\n\n'
+                f'@dg.asset(\n'
+                f'    name={_asset_name_for(node)!r},\n'
+                f'    group_name="alteryx_imported",\n'
+                f'    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream_name!r}))}},\n'
+                f'    description="Alteryx JupyterCode (tool {node.tool_id})",\n'
+                f')\n'
+                f'def {_asset_name_for(node)}(upstream: pd.DataFrame) -> pd.DataFrame:\n'
+                f'    df = upstream\n'
+                f'    # Original Alteryx JupyterCode body:\n'
+                f'    # ' + ("\n    # ".join((code_el.text or "").splitlines()[:30]) if code_el is not None and code_el.text else "(no embedded code)") + "\n"
+                f'    return df\n'
+            ),
+            notes=[f"JupyterCode on tool {node.tool_id}: passthrough stub; port Python by hand or wrap with dagstermill."],
+        ))(node.config.find("Code") or node.config.find("Script") or node.config.find("NotebookSource"))
+    ),
+    "AlteryxSpatialPluginsGui.SpatialProcess.SpatialProcess": (
+        # SpatialProcess covers single-geom transforms. Alteryx <Method> values:
+        #   CreateCentroid → centroid
+        #   CreateBoundary / ConvertPolygonsToPolylines → boundary
+        #   ConvertPolygonsToPoints → polygon_to_points
+        #   ConvertPolylinesToPolygons → line_to_polygon
+        #   CreateConvexHull → convex_hull
+        #   CreateBoundingRectangle → envelope
+        #   Simplify → simplify
+        #   Buffer → buffer
+        #   SetCompression → set_precision
+        lambda node, upstreams: (lambda method_el, spatial_el: (lambda _m: MappedTool(
+            component_id="spatial_process",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "method": {
+                    "createcentroid": "centroid",
+                    "createboundary": "boundary",
+                    "convertpolygonstopolylines": "polygon_to_lines",
+                    "convertpolygonstopoints": "polygon_to_points",
+                    "convertpolylinestopolygons": "line_to_polygon",
+                    "createconvexhull": "convex_hull",
+                    "createboundingrectangle": "envelope",
+                    "simplify": "simplify",
+                    "buffer": "buffer",
+                    "setcompression": "set_precision",
+                }.get(_m.lower() if _m else "centroid", "centroid"),
+                "geometry_column": (spatial_el.attrib.get("field") if spatial_el is not None else "geometry") or "geometry",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"SpatialProcess on tool {node.tool_id}: Alteryx method={_m!r} → "
+                f"spatial_process method. If `buffer` / `simplify` / `set_precision`, "
+                "set the corresponding tolerance / buffer_distance / precision_decimals "
+                "field in defs.yaml."
+            ],
+        ))((method_el.text or "").strip() if method_el is not None and method_el.text else ""))(
+            node.config.find("Method"), node.config.find("SpatialObj") or node.config.find("Field")
+        )
+    ),
+    "AlteryxSpatialPluginsGui.Optimization.Optimization": (
+        lambda node, upstreams: MappedTool(
+            component_id="select_columns",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Optimization on tool {node.tool_id}: linear/integer program "
+                "not auto-translated. Replace with a pulp / scipy.optimize.linprog "
+                "asset that consumes the same upstream."
+            ],
+        )
+    ),
+    "Optimization": (
+        lambda node, upstreams: MappedTool(
+            component_id="select_columns",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Optimization on tool {node.tool_id}: linear/integer program "
+                "not auto-translated. Replace with pulp / scipy.optimize.linprog."
+            ],
+        )
+    ),
+    "AlteryxBasePluginsGui.BasicDataProfile.BasicDataProfile": (
+        # Field Summary report — pandas equivalent is df.describe() in
+        # metadata. Passthrough so downstream tools still get the data.
+        lambda node, upstreams: MappedTool(
+            component_id="select_columns",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"BasicDataProfile on tool {node.tool_id}: passthrough. "
+                "For statistical summary, materialize the asset and consume "
+                "df.describe() / df.info() output in Dagster metadata."
             ],
         )
     ),
@@ -3463,6 +3701,174 @@ _CONTROL_FLOW_PLUGINS = {
     "AlteryxBasePluginsGui.ReportHeader.ReportHeader": (
         "Report Header — annotation only inside an Alteryx report. Drop."
     ),
+    "AlteryxSpatialPluginsGui.Buffer.Buffer": (
+        # Alteryx Buffer → geo_buffer. <BufferAmount value="N"/>
+        lambda node, upstreams: (lambda amt_el, spatial_el, units_el: MappedTool(
+            component_id="geo_buffer",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "geometry_column": (spatial_el.attrib.get("field") if spatial_el is not None else "geometry") or "geometry",
+                "distance": float(amt_el.attrib.get("value", "0.001") if amt_el is not None else "0.001"),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Buffer on tool {node.tool_id}: amount={amt_el.attrib.get('value') if amt_el is not None else '0.001'} "
+                f"units={(units_el.text or '').strip() if units_el is not None and units_el.text else 'degrees'}. "
+                "Verify the distance is in the right CRS units; reproject upstream if you want meters/miles."
+            ],
+        ))(node.config.find("BufferAmount"), node.config.find("SpatialObj"), node.config.find("Units"))
+    ),
+    "AlteryxSpatialPluginsGui.Cass.Cass": (
+        # Alteryx CASS (US-only address standardization). Route to free regex
+        # fallback by default — user picks libpostal / geoapify / nominatim in
+        # MIGRATION.md / defs.yaml for higher fidelity.
+        lambda node, upstreams: (lambda addr_el: MappedTool(
+            component_id="address_standardize",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "address_column": (
+                    (addr_el.attrib.get("field") or addr_el.text or "Address").strip()
+                    if addr_el is not None else "Address"
+                ),
+                "provider": "regex",  # free / no-dep default
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"CASS on tool {node.tool_id}: routed to address_standardize "
+                "(provider=regex by default; switch to libpostal / geoapify / "
+                "nominatim for higher fidelity). USPS CASS-certification is "
+                "a paid product — use a commercial vendor if you need DPV."
+            ],
+        ))(node.config.find("AddressField") or node.config.find("Address") or node.config.find("Field"))
+    ),
+    "AlteryxSpatialPluginsGui.AddressVerification.AddressVerification": (
+        lambda node, upstreams: (lambda addr_el: MappedTool(
+            component_id="address_standardize",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "address_column": (
+                    (addr_el.attrib.get("field") or addr_el.text or "Address").strip()
+                    if addr_el is not None else "Address"
+                ),
+                "provider": "regex",
+                "group_name": "alteryx_imported",
+            },
+            notes=[f"AddressVerification on tool {node.tool_id}: routed to address_standardize."],
+        ))(node.config.find("AddressField") or node.config.find("Address") or node.config.find("Field"))
+    ),
+    "AlteryxSpatialPluginsGui.Geocoder.Geocoder": (
+        # Alteryx Geocoder → geocoder (Nominatim default).
+        lambda node, upstreams: (lambda addr_el: MappedTool(
+            component_id="geocoder",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "address_column": (addr_el.text or "Address").strip() if addr_el is not None and addr_el.text else "Address",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Geocoder on tool {node.tool_id}: defaults to Nominatim "
+                "(free, ~1 req/sec rate limit). For higher volume switch to "
+                "google / mapbox / geoapify and set the corresponding API key."
+            ],
+        ))(node.config.find("AddressField") or node.config.find("Address") or node.config.find("Field"))
+    ),
+    "AlteryxSpatialPluginsGui.MakeGroup.MakeGroup": (
+        # Make Group bundles geometries into a single multi-geometry per group.
+        # Maps to summarize with spatialobjcombine action.
+        lambda node, upstreams: (lambda group_el, spatial_el: MappedTool(
+            component_id="summarize",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_by": [
+                    (group_el.attrib.get("field") or (group_el.text or "")).strip()
+                    if group_el is not None else ""
+                ],
+                "aggregations": {
+                    "Grouped_Geometry": {
+                        "col": (spatial_el.attrib.get("field") or (spatial_el.text or "geometry")).strip()
+                        if spatial_el is not None else "geometry",
+                        "agg": "spatialobjcombine",
+                    },
+                },
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"MakeGroup on tool {node.tool_id}: routed to summarize w/ "
+                "spatialobjcombine agg (unary_union per group)."
+            ],
+        ))(node.config.find("GroupField"), node.config.find("SpatialObj"))
+    ),
+    "AlteryxSpatialPluginsGui.Smooth.Smooth": (
+        # Smooth simplifies vertex chains — maps to spatial_process.simplify.
+        lambda node, upstreams: (lambda tol_el, spatial_el: MappedTool(
+            component_id="spatial_process",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "method": "simplify",
+                "geometry_column": (spatial_el.attrib.get("field") if spatial_el is not None else "geometry") or "geometry",
+                "tolerance": float(tol_el.attrib.get("value", "0.0001") if tol_el is not None else "0.0001"),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Smooth on tool {node.tool_id}: routed to spatial_process.simplify."
+            ],
+        ))(node.config.find("Tolerance"), node.config.find("SpatialObj"))
+    ),
+    "AlteryxSpatialPluginsGui.Generalize.Generalize": (
+        # Generalize is also a Douglas-Peucker pass; same target as Smooth.
+        lambda node, upstreams: (lambda tol_el, spatial_el: MappedTool(
+            component_id="spatial_process",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "method": "simplify",
+                "geometry_column": (spatial_el.attrib.get("field") if spatial_el is not None else "geometry") or "geometry",
+                "tolerance": float(tol_el.attrib.get("value", "0.0001") if tol_el is not None else "0.0001"),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Generalize on tool {node.tool_id}: routed to spatial_process.simplify."
+            ],
+        ))(node.config.find("Tolerance"), node.config.find("SpatialObj"))
+    ),
+    "AlteryxSpatialPluginsGui.HeatMap.HeatMap": (
+        # HeatMap is a visualization — no Dagster-native runtime semantic.
+        # Passthrough so downstream tools still get the upstream DataFrame.
+        lambda node, upstreams: MappedTool(
+            component_id="select_columns",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"HeatMap on tool {node.tool_id}: passthrough; the heat-map "
+                "rendering is a visual concern. Replace with a Folium / Plotly "
+                "asset that consumes the same upstream."
+            ],
+        )
+    ),
+    "AlteryxSpatialPluginsGui.Demographic.Demographic": (
+        lambda node, upstreams: MappedTool(
+            component_id="select_columns",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Demographic on tool {node.tool_id}: Alteryx data product (paid). "
+                "Passthrough emitted; replace with the equivalent Census / "
+                "OpenStreetMap / data-vendor source asset."
+            ],
+        )
+    ),
     "AlteryxSpatialPluginsGui.ReportMap.ReportMap": (
         "Report Map — Alteryx's spatial map renderer for the HTML report. "
         "Drop, or replace with a Plotly / Folium map in a notebook asset."
@@ -3475,6 +3881,21 @@ _CONTROL_FLOW_PLUGINS = {
     "PortfolioPluginsGui.ComposerOverlay.Overlay": (
         "Portfolio Composer Overlay — stacks report sections. Drop or "
         "replace with the pdf_report template_html mode for full layout."
+    ),
+    "AlteryxBasePluginsGui.Message.Message": (
+        "Message — emits a runtime notification. Use dagster's logger / "
+        "Dagster+ alerting if the message was load-bearing; otherwise drop."
+    ),
+    "AlteryxGuiToolkit.Error.Error": (
+        "Error — fails the workflow on a condition. Move to a Dagster "
+        "AssetCheck or an op-level raise for the equivalent. Drop the "
+        "Error tool itself."
+    ),
+    "AlteryxBasePluginsGui.MacroInput.MacroInput": (
+        "Macro Input — boundary marker for a custom .yxmc. The macro "
+        "splicer wires this into the parent workflow; standalone MacroInput "
+        "nodes only appear when the macro itself was the imported file. "
+        "Treat as a no-op input."
     ),
 }
 
