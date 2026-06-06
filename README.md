@@ -45,10 +45,14 @@ The `--install` flag shells out to `dagster-component add <id> --auto-install` f
 | **Parse** | DateTime · Regex (Parse Simple / Parse Complex / Replace / Match / Tokenize) · JSON Parse · XML Parse · Text To Columns | `datetime_parser` (whitespace-tolerant) · `regex_parser` (ParseSimple → `extract` w/ `RootName1…N` output cols, auto-wraps groupless patterns) · `json_flatten` · `xml_parser` · `text_to_columns` |
 | **Multi-input** | Join · Join Multiple · Union · Append · Append Fields · Find Replace | `dataframe_join` (forwards embedded `<SelectFields/>` as post-merge `rename` / `drop_columns` with fuzzy `Right_`/`Left_` prefix matching; coalesces mismatched join-key dtypes) · inline pandas chained `.merge()` · `dataframe_union` · alias · `append_fields` · `find_replace` |
 | **GenerateRows** | per-row Expression_Init/Cond/Loop expansion | `generate_rows` mode `loop_expression` — emits one row per loop iteration; integer / date / datetime stepping all work |
-| **Spatial** | Create Points · Geo Buffer · Geo Overlay · Geo Simplify · Drive Time · Poly Split · **Spatial Match** · **Distance** · **Find Nearest** · **Poly Build** · **Spatial Info** · **Map Input** · **Trade Area** | `points_from_latlon` · `geo_buffer` · `geo_overlay` · `geo_simplify` · `drive_time` (openrouteservice / google / mapbox / osrm) · `poly_split` · `spatial_join` (accepts pre-built geom column on points side) · `distance_calculator` · `nearest_neighbors` (auto-explodes Point feature cols; FindNearest's k=1 distance → `DistanceMiles`) · `poly_build` (geom-col input mode for `<SpatialObj/>`) · `spatial_info` · `file_ingestion` · `drive_time` w/ travel-mode profile |
+| **Spatial — full palette** | Create Points · Buffer · Geocoder · Geo Overlay · Geo Simplify · Drive Time · Poly Build · Poly Split · Spatial Info · Spatial Match · Spatial Process · Distance · Find Nearest · Make Group · Smooth / Generalize · Map Input · Trade Area · Heat Map · Demographic · Report Map | `points_from_latlon` · `geo_buffer` · `geocoder` (Nominatim default) · `geo_overlay` · `geo_simplify` · `drive_time` (openrouteservice / google / mapbox / osrm) · `poly_build` · inline polysplit · `spatial_info` · `spatial_join` · `spatial_process` (centroid / boundary / convex_hull / envelope / simplify / buffer / set_precision / polygon↔points / line↔polygon) · `distance_calculator` · `nearest_neighbors` (FindNearest's k=1 distance → `DistanceMiles`) · `summarize` w/ spatialobjcombine · `spatial_process.simplify` · `file_ingestion` · `drive_time` w/ travel-mode · passthrough · passthrough · passthrough |
+| **CASS / Address standardization** | CASS · Address Verification | `address_standardize` (free, no API key required for `regex` mode; libpostal / Geoapify / Nominatim available; USPS CASS-certification is paid — use a commercial vendor for DPV) |
 | **Predictive** | Linear / Logistic / Decision Tree / Random Forest / Naive Bayes / Neural Network / SVM / Gradient Boosting / PCA / Score | sklearn-backed registry components w/ `model_path` joblib save; Score loads a saved model and predicts |
-| **Time Series** | TS Forecast / TS Plot | `arima_forecast` · `ets_forecast` |
-| **In-DB** (SQL pushdown) | Connect · Input · Filter · Formula · Select · Summarize · Join · Union · Sample · Stream Out · Write Data | each tool → one `sql_transform` asset that CTASs an intermediate table. Connection routed via an env var slugified from the Alteryx `<Connection>` name (e.g. `Snowflake_Prod` → `SNOWFLAKE_PROD_URL`). **Not yet:** collapsing connected In-DB subgraphs into a single `warehouse_pipeline` CTE chain — that preserves Alteryx's single-query pushdown and lets In-DB Stream Out route via `warehouse_pipeline.return_dataframe=True`. The corpus we test against has no In-DB workflows so this hasn't shipped yet. |
+| **Time Series** | TS Forecast / TS Plot · ARIMA · ETS · Time Series Filler · Imputation | `arima_forecast` · `ets_forecast` · passthrough · `data_cleansing` (stock macros routed: `predictive_tools\arima.yxmc` etc.) |
+| **R Tool / Jupyter Code** | R Tool · Jupyter Code | Inline `@dg.asset` stub with the original script preserved as a comment block. Port to Python or wrap with `rpy2` / `subprocess Rscript` / `dagstermill`. |
+| **In-DB** (SQL pushdown — collapsed) | Connect · Input · Filter · Formula · Select · Summarize · Join · Union · Sample · Stream Out · Write Data | Connected In-DB subgraphs collapse into ONE `warehouse_pipeline` asset (CTE chain, single warehouse round-trip). Stream Out sinks route via `return_dataframe: true` so downstream non-In-DB tools consume a DataFrame. Connection env var is slugified from `<Connection>` (e.g. `Snowflake_Prod` → `SNOWFLAKE_PROD_URL`); SQL dialect auto-detected from the connection name. |
+| **Reporting** | Render · Portfolio Composer (Image / Render / Table / Text / Layout / Overlay) | `pdf_report` for Render / Image. Composer Table / Text emit passthrough so downstream Joins keep working; combine with the terminal Render's `pdf_report` template_html for full styled layout. Layout / Overlay are visual-only — skipped. |
+| **Apps / Interface** | Tab · CheckBoxGroup · NumericUpDown · Label · Control Parameter · Action · Macro Input/Output | Skipped as control-flow with notes — Alteryx App interface tools have no Dagster-runtime equivalent. The compute inside the App (under ToolContainers) still imports. |
 | **Macros (`.yxmc`)** | Custom macros · stock macros (Cleanse) | `macro_splicer.py` recursively inlines `.yxmc` (max depth 5), renumbers tool_ids with `m<parent>_` prefix, rewires Macro Input/Output anchors. Stock macros (Cleanse, etc.) route to dedicated registry components instead of inlining. |
 | **Control flow** | Block Until Done · Cache Dataset · Browse · Message · Detour · Tool Container · Comment · Text Box · HTMLBox | Skipped (Dagster's DAG / IO manager / `AutomationCondition` already provides Block Until Done / Cache; visual-only tools have no runtime equivalent). Tool Container's INNER tools still get imported. |
 
@@ -94,27 +98,34 @@ Cost: ~$0.0004 per flagged expression at gpt-4o-mini. One-time per import.
 
 ## What it doesn't do today
 
-Honest gaps — what won't work after import:
-
 | Category | Status |
 |---|---|
-| **In-DB chain collapse** | Per-tool mapping works (each In-DB tool emits its own `sql_transform` with intermediate CTAS). The single-query collapse into `warehouse_pipeline` (CTE chain that preserves Alteryx's pushdown semantics) is **not yet wired** — needs to be rebuilt after the registry deletion that wiped the original implementation. |
-| **Alteryx Apps** | Interface tools (Macro Input/Output / Control Parameter / Action) are skipped — these only exist for Alteryx's App/Macro UI and have no Dagster equivalent. |
-| **Reporting (Render / Layout / Email / Charting)** | Render and PortfolioComposer route to `pdf_report` for the table-style output. Email/Layout/Charting (HTML report builders) are skipped — different paradigm. |
-| **MultiRowFormula edge cases** | Pure `[Row±N:Col]` → `window_calculation`, compound IF/THEN/ELSE → `formula` with `df['Col'].shift(N)`. Expressions with nested `REGEX_Match` / function calls that don't fully deterministic-translate still need manual review (flagged in MIGRATION.md). |
-| **Browse / Tool Container / Comment / Text Box / HTMLBox** | Skipped as control-flow — purely visual in Alteryx, no runtime equivalent. Tool Container's INNER tools still get imported. |
-| **Custom data quality / lineage tools** | If your shop ships custom Alteryx tools (proprietary connectors, GIS-vendor specific tools, etc.), they land in MIGRATION.md as unmapped. The `--llm-translate` fallback can sometimes infer a translation for the formula bodies inside them. |
-| **Alteryx engine-internal nuances** | A few Alteryx semantics aren't 1:1 in pandas — e.g., Alteryx's implicit type coercion when mixing dtypes in expressions. Workflows that rely on these may need targeted fixes in the generated `defs.yaml`. |
+| **USPS CASS-certification (DPV / ZIP+4 validation)** | Address parsing ships via `address_standardize` (regex / libpostal / Geoapify / Nominatim). USPS CASS-certification itself is a paid product — use a commercial vendor (Smarty / Loqate / USPS) when DPV is required. |
+| **Multi-output Alteryx anchors** | DateTime's `B` (bad rows) / Filter's `T/F` / Join's `L/J/R` anchors aren't yet emitted as separate Dagster assets. Coerce-on-error gets us same-row-count correctness for most cases. Dagster's `@multi_asset(outs={...})` is the right shape; not yet wired. |
+| **MultiRowFormula edge cases** | Pure `[Row±N:Col]` → `window_calculation`, compound IF/THEN/ELSE → `formula` with `df['Col'].shift(N)`. Expressions with deeply nested function calls inside the row-ref still need manual review (flagged in MIGRATION.md). |
+| **Visual-only tools (Heat Map / Plotly Charting / Report Map / Charting)** | Passthrough emitted so the data flows downstream — the visual rendering is dropped. Build a Plotly / Folium asset that consumes the same upstream for inline rendering. |
+| **R Tool / Jupyter Code** | Emitted as inline `@dg.asset` stubs with the original script preserved as a comment. Port to Python or wrap with `rpy2` / `dagstermill` — we don't auto-translate R or notebook code. |
+| **Custom vendor / shop-specific macros** | If your shop ships proprietary `.yxmc` macros that aren't in the imported `.yxzp` bundle, they land in MIGRATION.md as unmapped. The `--llm-translate` fallback can sometimes infer expressions inside them. |
+| **Alteryx engine-internal nuances** | A handful of Alteryx semantics aren't 1:1 in pandas — e.g., implicit type coercion mixing dtypes in expressions, B-anchor error routing. Workflows depending on these may need targeted edits in the generated `defs.yaml`. |
 
 If you hit a gap not listed here, open an issue with the Alteryx XML and we'll add it.
 
 ## Validation corpus
 
-Continuously tested against the [Alteryx Weekly Challenge](https://community.alteryx.com/categories/weeklychallenge-board) workflows — 83 .yxmd files covering most tool families. Current stats:
+Continuously tested against **106 real Alteryx workflows** drawn from:
 
-- Real-compute mapping rate: **100%** (every non-control-flow tool maps to a component)
+- [Alteryx Weekly Challenge community board](https://community.alteryx.com/categories/weeklychallenge-board) (atcodedog05 + sh0kat solution sets) — 83 .yxmd
+- [Szymon-Czuszek Weekly Challenges](https://github.com/Szymon-Czuszek/Alteryx-Weekly-Challenges) — 19 .yxmd / .yxzp (Alteryx Apps included)
+- [Szymon-Czuszek Superstore Reporting](https://github.com/Szymon-Czuszek/Superstore-Reporting) — 1 .yxzp
+- [osabnis1776 iShares ETF Analysis](https://github.com/osabnis1776/iShares-IVV-ETF-Market-Risk-Analysis) — 1 .yxmd
+- [OwenBData R-vs-Alteryx](https://github.com/OwenBData/RvsAlteryxBlog) — 1 .yxmd
+- **Mario Kart challenge 498** (.yxzp w/ bundled macro) — 1 workflow
+
+Current stats:
+
+- Real-compute mapping rate: **~99%** (1372 / 1386 non-control-flow tools)
 - Static validation pass: **100%** (every emitted defs.yaml loads under `dg check`)
-- Materialization (with auto-stubbed inputs): **~69%** and rising; remaining failures are split between Alteryx-internal workflow quirks (a few tools reference output cols before they're created) and component-internal long-tail edge cases.
+- Materialization rate (with auto-stubbed inputs): **~66%** and rising; remaining failures are split between Alteryx-internal workflow quirks (a few tools reference output cols before they're created) and stub-data dtype mismatches that don't bite real production data.
 
 ## License
 
