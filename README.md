@@ -94,13 +94,19 @@ Cost: ~$0.0004 per flagged expression at gpt-4o-mini. One-time per import.
 |---|---|
 | Reporting tools (Render / Layout / Email / Charting) | Skipped — different paradigm; reports don't have a clean Dagster equivalent |
 | Interface tools (Macro Input/Output / Control Parameter / Action) | Skipped — these only exist for Alteryx Apps/Macros UI |
-| Documentation tools (Comment / Tool Container / Explorer Box) | Skipped — purely visual in the Alteryx canvas |
-| Data Investigation tools (Field Summary / Distribution Analysis / Pearson / Frequency Table) | Not yet — could partially map to `summarize` + `pandas.describe()` |
-| Spatial tools (Spatial Match / Distance / Trade Area) | Not yet — would need a GeoPandas-based component |
-| Predictive tools (Linear/Logistic Regression / Decision Tree / Random Forest) | Not yet — depends on which scikit-learn components are in the registry |
-| Time Series tools (TS Forecast / TS Plot) | Partial — registry has `arima_forecast`; mapper not wired yet |
-| Custom macros (`.yxmc`) | Inventoried in MIGRATION.md, not auto-inlined. Re-import each `.yxmc` separately and wire by hand. |
-| Alteryx Apps (workflows with Interface tools) | Not supported — the Interface tools have no Dagster equivalent |
+| Documentation tools (Comment / Tool Container / Browse / HTMLBox / Text Box) | Skipped as control-flow — purely visual. Tool Container's INNER tools still get imported (the container itself is a no-op wrapper). |
+| Auto Field (runtime dtype inference) | Skipped — Dagster components handle dtype inference at read time (`pd.read_csv`, `inline_dataframe`'s `dtypes` field). |
+| Data Investigation tools (Field Summary / Pearson Correlation / Frequency Table) | **Pearson Correlation** ✓ via `pearson_correlation` component. Field Summary maps via `summarize` + `dataframe_describe`. Frequency Table not yet wired. |
+| Basic spatial (Create Points / Geo Buffer / Geo Overlay / Geo Simplify / Drive Time / Poly Split) | **Done** — `points_from_latlon`, `geo_buffer`, `geo_overlay`, `geo_simplify`, `drive_time` (openrouteservice / google / mapbox / osrm), `poly_split`. |
+| Advanced spatial (Spatial Match / Distance / Trade Area / Find Nearest / Poly Build / Map Input / Spatial Info) | Partial — Find Nearest can route to `nearest_neighbors`. Spatial Match / Distance / Trade Area / Poly Build mappers not yet wired. |
+| Predictive — sklearn-backed (Linear/Logistic Regression / Decision Tree / Random Forest / Naive Bayes / Neural Network / SVM / Gradient Boosting / PCA / Score) | Registry components exist with `model_path` joblib save; Alteryx-plugin → mapper entries not yet wired. |
+| Predictive — statsmodels-backed (Count Regression / Gamma Regression) | Registry components exist with `.save()` / `sm.load()`; mapper entries not yet wired. |
+| Time Series (TS Forecast / TS Plot) | Registry has `arima_forecast`, `ets_forecast`; mapper entries not yet wired. |
+| Custom macros (`.yxmc`) | **Done** — `macro_splicer.py` recursively inlines macros (max depth 5), renumbers tool_ids with `m<parent>_` prefix, rewires Macro Input/Output anchors. Stock macros like `Cleanse.yxmc` route to dedicated registry components (`data_cleansing`) instead of inlining. |
+| In-DB tools (Connect/Input/Filter/Formula/Select/Summarize/Join/Union/Sample/StreamOut/WriteData) | Mapped 1:1 to `sql_transform` per-tool today. **Pending:** collapse In-DB subgraphs into a single `warehouse_pipeline` CTE chain (preserves Alteryx's pushdown semantics; In-DB Stream Out routes via `warehouse_pipeline.return_dataframe=True`). |
+| Multi-Row Formula (window-style) | Not yet — would need a `multi_row_formula` component (windowed `df.shift()` / rolling pattern). |
+| Dynamic Rename (pattern-based) | Not yet — maps roughly to `select_columns` with `rename`; needs the rename-pattern → column-pair expansion. |
+| Alteryx Apps (Interface tools / Action / Control Parameter) | Not supported — Interface tools have no Dagster equivalent. |
 
 For In-DB tools: each Alteryx In-DB tool becomes its own `sql_transform` asset that materializes an intermediate table. This is the simplest correct mapping but loses Alteryx's single-query pushdown. Future versions can detect connected In-DB subgraphs and collapse them into one `sql_transform` with CTEs.
 

@@ -2376,6 +2376,21 @@ _CONTROL_FLOW_PLUGINS = {
         "the comment preserved, add it to the asset's `description` field "
         "in defs.yaml or as a docstring on the inline-py asset."
     ),
+    "AlteryxGuiToolkit.ToolContainer.ToolContainer": (
+        "Tool Container — visual grouping only (no compute). Inner tools "
+        "are spliced into the parent graph during import; the container "
+        "itself emits no Dagster asset."
+    ),
+    "AlteryxGuiToolkit.HtmlBox.HtmlBox": (
+        "HTML Box — documentation only. Drop; copy into the project README "
+        "if the content is worth preserving."
+    ),
+    "AlteryxBasePluginsGui.AutoField.AutoField": (
+        "Auto Field — runtime type inference. Dagster components handle "
+        "dtype inference automatically (pandas read_csv / inline_dataframe "
+        "use the configured dtypes; downstream tools coerce per-call). No "
+        "emit needed."
+    ),
     "AlteryxGuiToolkit.Detour.Detour": (
         "Detour — conditional bypass. Dagster equivalent: AutomationCondition "
         "on the downstream asset, or a `dagster.skip_if` pattern in a sensor. "
