@@ -2007,8 +2007,14 @@ def _map_cross_tab(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     methods = cfg.find("Methods")
     if methods is not None:
         m = methods.find("Method")
-        if m is not None and m.text:
-            method = m.text.strip().lower()
+        if m is not None:
+            # Alteryx stores the value on the attribute (method="First")
+            # OR as the element text — handle both.
+            method_raw = m.attrib.get("method") or (m.text or "")
+            if method_raw:
+                method = method_raw.strip().lower()
+    # Normalize Alteryx aggregate names to pandas pivot_table conventions.
+    method = {"countdistinct": "nunique", "concat": "first"}.get(method, method)
     return MappedTool(
         component_id="pivot",
         asset_name=_asset_name_for(node),
