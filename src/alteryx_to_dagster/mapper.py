@@ -1090,6 +1090,11 @@ def _map_datetime_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     else:
         # string → datetime
         attrs["input_format"] = fmt
+    # Alteryx DateTime tool is forgiving — values that don't match the format
+    # land in a separate "B" anchor (error rows) instead of crashing. Mirror
+    # that by defaulting to errors='coerce' (bad rows → NaT) so a single
+    # malformed value doesn't fail the whole asset.
+    attrs["on_parse_error"] = "coerce"
 
     return MappedTool(
         component_id="datetime_parser",
@@ -2902,23 +2907,24 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     "AlteryxBasePluginsGui.MultiRowFormula.MultiRowFormula": _map_multi_row_formula,
     "AlteryxConnectorGui.Download.Download": (
         # Alteryx Download → per_row_http_fetcher (per-row HTTP GET).
-        lambda node, upstreams: MappedTool(
+        # Reads <URLField>X</URLField> for the URL column; falls back to "URL".
+        lambda node, upstreams: (lambda url_el: MappedTool(
             component_id="per_row_http_fetcher",
             asset_name=_asset_name_for(node),
             attributes={
                 "upstream_asset_key": _single_upstream(upstreams),
-                "url_column": "URL",
+                "url_column": (url_el.text or "URL").strip() if url_el is not None and url_el.text else "URL",
                 "method": "GET",
                 "timeout_seconds": 30,
                 "output_prefix": "DownloadData",
                 "group_name": "alteryx_imported",
             },
             notes=[
-                f"Download on tool {node.tool_id}: defaults to url_column='URL' "
-                "and output_prefix='DownloadData' (Alteryx Download tool conventions). "
-                "Confirm URL column name + headers/auth in defs.yaml."
+                f"Download on tool {node.tool_id}: url_column from <URLField/> or "
+                "defaults to 'URL'. output_prefix='DownloadData' (Alteryx convention). "
+                "Confirm headers / auth / body in defs.yaml."
             ],
-        )
+        ))(node.config.find("URLField") or node.config.find("UrlField") or node.config.find("URL"))
     ),
     # Aggregates / reshape
     "AlteryxBasePluginsGui.Summarize.Summarize": _map_summarize,
