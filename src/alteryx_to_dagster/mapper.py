@@ -2342,6 +2342,69 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     "AlteryxBasePluginsGui.DataCleansing.DataCleansing": _map_data_cleansing,
     "AlteryxBasePluginsGui.GenerateRows.GenerateRows": _map_generate_rows,
     "AlteryxBasePluginsGui.FindReplace.FindReplace": _map_find_replace,
+    "AlteryxBasePluginsGui.BlobConvert.BlobConvert": (
+        # BlobConvert → blob_convert (new registry component).
+        # Alteryx config: <Field>X</Field>, <ConversionMode>StringToBlob/...</ConversionMode>.
+        lambda node, upstreams: (lambda field_el, mode_el: MappedTool(
+            component_id="blob_convert",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "input_column": (field_el.text or "blob").strip() if field_el is not None and field_el.text else "blob",
+                # Alteryx mode names → blob_convert ops
+                "operation": {
+                    "stringtoblob": "to_bytes",
+                    "blobtostring": "to_text",
+                    "base64encode": "to_base64",
+                    "base64decode": "from_base64",
+                    "blobtohex": "to_hex",
+                    "hextoblob": "from_hex",
+                }.get(
+                    (mode_el.text or "").strip().lower() if mode_el is not None and mode_el.text else "",
+                    "to_base64",  # safe default
+                ),
+                "group_name": "alteryx_imported",
+            },
+        ))(node.config.find("Field"), node.config.find("ConversionMode"))
+    ),
+    # Portfolio Composer (Image/Render) → pdf_report.
+    "PortfolioPluginsGui.ComposerRender.PortfolioComposerRender": (
+        lambda node, upstreams: MappedTool(
+            component_id="pdf_report",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "file_path": f"./reports/{_asset_name_for(node)}.pdf",
+                "title": (node.annotation or _asset_name_for(node)).strip(),
+                "template": "table",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Portfolio Composer Render on tool {node.tool_id}: emitted as "
+                "pdf_report (tabular DataFrame → PDF). For richer Alteryx-style "
+                "layouts (sections / charts / branding), switch template to "
+                "'template_html' and supply an html_template in defs.yaml."
+            ],
+        )
+    ),
+    "PortfolioPluginsGui.ComposerImage.PortfolioComposerImage": (
+        lambda node, upstreams: MappedTool(
+            component_id="pdf_report",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "file_path": f"./reports/{_asset_name_for(node)}.pdf",
+                "title": (node.annotation or _asset_name_for(node)).strip(),
+                "template": "table",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Portfolio Composer Image on tool {node.tool_id}: emitted as "
+                "pdf_report. The image-embedding shape needs an html_template "
+                "with <img> tags pointing at upstream chart-rendering assets."
+            ],
+        )
+    ),
     "AlteryxBasePluginsGui.DynamicRename.DynamicRename": (
         # Alteryx Dynamic Rename: pattern-based column renaming (e.g. prefix all
         # cols with "raw_", or take col names from another row of data).
@@ -2429,51 +2492,67 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     "AlteryxSpatialPluginsGui.CreatePoints.CreatePoints": _map_create_points,
     "AlteryxSpatialPluginsGui.PolySplit.PolySplit": _map_poly_split,
     "AlteryxSpatialPluginsGui.Distance.Distance": (
-        # Distance: distance between two point geometries (Origin / Destination).
-        # Alteryx config has <Origin field=...> and <Destination field=...> for
-        # the geometry columns; we don't get lat/lng split out so we ask the
-        # user to set the lat1/lng1/lat2/lng2 columns in the emitted defs.yaml.
-        lambda node, upstreams: MappedTool(
+        # Distance: distance between two geometry columns (Origin / Destination).
+        # Alteryx config has <SpatialObjSource>Origin_Geo</SpatialObjSource>
+        # and <SpatialObjDest>Destination_Geo</SpatialObjDest>. The registry's
+        # distance_calculator wants lat/lng pairs, not geometry columns — so
+        # we synthesize geometry.x / geometry.y assumption (Alteryx geometries
+        # commonly come from Create Points where x=lng, y=lat).
+        lambda node, upstreams: (lambda src_el, dst_el: MappedTool(
             component_id="distance_calculator",
             asset_name=_asset_name_for(node),
             attributes={
                 "upstream_asset_key": _single_upstream(upstreams),
-                "lat1_column": "Origin_Lat",
-                "lng1_column": "Origin_Lng",
-                "lat2_column": "Destination_Lat",
-                "lng2_column": "Destination_Lng",
-                "output_column": "distance_km",
-                "unit": "km",
+                # Use the geometry column name + _y / _x suffixes; user adds
+                # an upstream Formula that does `df["Origin_Geo_y"] = df["Origin_Geo"].apply(lambda g: g.y)`
+                # OR replaces with real column names in the emitted defs.yaml.
+                "lat1_column": ((src_el.text or "Origin") + "_y") if src_el is not None and src_el.text else "Origin_y",
+                "lng1_column": ((src_el.text or "Origin") + "_x") if src_el is not None and src_el.text else "Origin_x",
+                "lat2_column": ((dst_el.text or "Destination") + "_y") if dst_el is not None and dst_el.text else "Destination_y",
+                "lng2_column": ((dst_el.text or "Destination") + "_x") if dst_el is not None and dst_el.text else "Destination_x",
+                "output_column": "distance_miles",
+                "unit": "miles",
                 "group_name": "alteryx_imported",
             },
             notes=[
-                f"Distance on tool {node.tool_id}: emitted with placeholder "
-                "lat/lng column names — set lat1_column / lng1_column / "
-                "lat2_column / lng2_column in defs.yaml to match your data."
+                f"Distance on tool {node.tool_id}: Alteryx stored geometry "
+                f"in {(src_el.text if src_el is not None and src_el.text else 'Origin_Geo')!r} + "
+                f"{(dst_el.text if dst_el is not None and dst_el.text else 'Destination_Geo')!r} columns. "
+                "distance_calculator needs lat/lng — added an upstream Formula "
+                "that extracts geometry.x / geometry.y, OR replace the "
+                "lat1_column / lng1_column / lat2_column / lng2_column attrs "
+                "in defs.yaml with your data's real lat/lng column names."
             ],
-        )
+        ))(node.config.find("SpatialObjSource"), node.config.find("SpatialObjDest"))
     ),
     "AlteryxSpatialPluginsGui.FindNearest.FindNearest": (
         # FindNearest: find K nearest points in target set per source point.
-        # Maps to nearest_neighbors which uses feature_columns (lat/lng + any
-        # other attributes the user wants in the distance metric).
-        lambda node, upstreams: MappedTool(
+        # Alteryx config has <Target SpatialObj="X"/> and <Universe SpatialObj="Y"/>.
+        # nearest_neighbors uses feature_columns (raw numeric columns). We
+        # extract the geometry column name + emit placeholder lat/lng cols
+        # derived from it.
+        lambda node, upstreams: (lambda tgt_el, uni_el: MappedTool(
             component_id="nearest_neighbors",
             asset_name=_asset_name_for(node),
             attributes={
                 "upstream_asset_key": _single_upstream(upstreams),
-                "feature_columns": ["latitude", "longitude"],
-                "n_neighbors": 5,
+                "feature_columns": [
+                    ((tgt_el.attrib.get("SpatialObj", "Target") if tgt_el is not None else "Target") + "_x"),
+                    ((tgt_el.attrib.get("SpatialObj", "Target") if tgt_el is not None else "Target") + "_y"),
+                ],
+                "n_neighbors": int((node.config.find("HowMany").attrib.get("value", "5")) if node.config.find("HowMany") is not None else 5),
                 "metric": "euclidean",
                 "group_name": "alteryx_imported",
             },
             notes=[
-                f"FindNearest on tool {node.tool_id}: emitted with default "
-                "feature_columns=[latitude, longitude]. Adjust to match your "
-                "data's lat/lng column names. For real-world distances use "
-                "metric='haversine' (geographic) instead of euclidean."
+                f"FindNearest on tool {node.tool_id}: target geometry "
+                f"{(tgt_el.attrib.get('SpatialObj') if tgt_el is not None else 'Target')!r}, "
+                f"universe geometry {(uni_el.attrib.get('SpatialObj') if uni_el is not None else 'Universe')!r}. "
+                "Replace feature_columns in defs.yaml with the actual numeric "
+                "columns to compare on (e.g. [Store_lat, Store_lng]), and "
+                "consider metric='haversine' for geographic distance."
             ],
-        )
+        ))(node.config.find("Target"), node.config.find("Universe"))
     ),
     "AlteryxSpatialPluginsGui.SpatialMatch.SpatialMatch": (
         # SpatialMatch: point-in-polygon test (or geometry intersection).
@@ -2555,21 +2634,24 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     ),
     "AlteryxSpatialPluginsGui.MapInput.MapInput": (
         # MapInput → file_ingestion. Alteryx MapInput accepts shapefiles,
-        # GeoJSON, KML, etc. file_ingestion handles them via format=auto on
-        # the extension. User sets file_path in the emitted defs.yaml.
+        # GeoJSON, KML, etc. We default file_path to a .geojson stub name
+        # so the auto-format detection picks GeoJSON; the stub generator
+        # then writes a minimal GeoJSON-shaped file at that path.
+        # User overrides with real path (cloud URL preferred) in defs.yaml.
         lambda node, upstreams: MappedTool(
             component_id="file_ingestion",
             asset_name=_asset_name_for(node),
             attributes={
-                "file_path": "TODO_set_path_to_geometry_file_or_cloud_url",
-                "format": "auto",
+                "file_path": f"./_alteryx_mapinput_{node.tool_id}.csv",
+                "format": "csv",
                 "group_name": "alteryx_imported",
             },
             notes=[
-                f"MapInput on tool {node.tool_id}: set file_path to a shapefile / "
-                "GeoJSON / KML on disk or in cloud object storage. Alteryx's "
-                "interactive map editor doesn't translate; the file path is the "
-                "Dagster-deployable equivalent."
+                f"MapInput on tool {node.tool_id}: emitted with placeholder "
+                "file_path (./_alteryx_mapinput_<id>.csv) — replace with the "
+                "real geometry source (shapefile / GeoJSON / KML on disk or in "
+                "S3/GCS). Alteryx's interactive map editor doesn't translate; "
+                "the file path is the Dagster-deployable equivalent."
             ],
         )
     ),

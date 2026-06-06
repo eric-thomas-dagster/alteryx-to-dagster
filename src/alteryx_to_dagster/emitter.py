@@ -69,6 +69,9 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "geo_simplify": "GeoSimplifyComponent",
     "pearson_correlation": "PearsonCorrelationComponent",
     "per_row_http_fetcher": "PerRowHttpFetcherComponent",
+    # New components from v0.5.14
+    "blob_convert": "BlobConvertComponent",
+    "pdf_report": "PdfReportComponent",
     # Spatial — new geo components from v0.5.13
     "poly_build": "PolyBuildComponent",
     "spatial_info": "SpatialInfoComponent",
