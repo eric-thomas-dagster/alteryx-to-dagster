@@ -1617,18 +1617,33 @@ def _map_cross_tab(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 
 
 def _map_transpose(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Transpose → `unpivot` (wide → long)."""
+    """Alteryx Transpose → `unpivot` (wide → long).
+
+    Filters Alteryx's `*Unknown` placeholder out of both key + data field
+    lists — `*Unknown` is Alteryx's wildcard for "all other columns" and
+    isn't a real column name. If `*Unknown` appears in the data fields,
+    drop the whole list (signals "melt all non-id columns", which unpivot
+    handles natively when value_columns is None).
+    """
     key_fields: List[str] = []
     data_fields: List[str] = []
+    data_has_wildcard = False
     cfg = node.config
     for f in cfg.findall("KeyFields/Field"):
         fn = f.attrib.get("field")
-        if fn:
+        if fn and fn != "*Unknown":
             key_fields.append(fn)
     for f in cfg.findall("DataFields/Field"):
         fn = f.attrib.get("field")
-        if fn and f.attrib.get("selected", "True").lower() != "false":
-            data_fields.append(fn)
+        if not fn or f.attrib.get("selected", "True").lower() == "false":
+            continue
+        if fn == "*Unknown":
+            data_has_wildcard = True
+            continue
+        data_fields.append(fn)
+    if data_has_wildcard:
+        # Signal to unpivot: "use all non-id columns" by passing None.
+        data_fields = []
     return MappedTool(
         component_id="unpivot",
         asset_name=_asset_name_for(node),
