@@ -34,6 +34,12 @@ _FIELD2_ATTR_RE = __import__("re").compile(r"\bfield2=\"([^\"]+)\"")
 _RENAME_ATTR_RE = __import__("re").compile(r"\brename=\"([^\"]+)\"")
 _EXPRESSION_ATTR_RE = __import__("re").compile(r"\bexpression=\"([^\"]+)\"")
 _NAME_ATTR_RE = __import__("re").compile(r"\bname=\"([^\"]+)\"")
+# Tools like FindReplace store column refs as element TEXT, not attributes —
+# e.g. <FieldFind>find</FieldFind> / <FieldSearch>value</FieldSearch>.
+# Match any <SomeFieldName>text</SomeFieldName> where the tag ends in "Field".
+_FIELD_ELEMENT_RE = __import__("re").compile(
+    r"<(?:[A-Z][a-zA-Z]*Field|Field)>([^<\n]{1,80})</",
+)
 
 
 def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> list:
@@ -61,6 +67,9 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> list
         cols.update(_FIELD2_ATTR_RE.findall(cfg_text))
         cols.update(_EXPRESSION_ATTR_RE.findall(cfg_text))
         cols.update(_RENAME_ATTR_RE.findall(cfg_text))
+        # Element-text patterns (FindReplace, JSON Parse, XMLParse — these
+        # store column refs as <SomeField>colname</SomeField>, not field=).
+        cols.update(_FIELD_ELEMENT_RE.findall(cfg_text))
         # Don't walk Field name="..." for tools that DEFINE columns (TextInput).
         # Recurse into THIS node's own downstreams (transitively).
         stack.extend(e.dest_tool for e in wf.downstreams_of(tid))
@@ -79,16 +88,36 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> list
 
 def _stub_value_literal_for(col: str) -> str:
     """Pick a Python literal value for a stub-row column based on the
-    column name. Returns a string that can be embedded directly in `repr`."""
+    column name. Returns a string that can be embedded directly in `repr`.
+
+    Heuristic order:
+      1. Date-ish names → ISO date string
+      2. Lat / Lon → float
+      3. Anything that contains a numeric-sounding token (count, area, sq,
+         distance, pct, %, etc.) → 1 (an int that survives both
+         multiplication AND division as the right-hand side; 0 would cause
+         downstream divide-by-zero crashes in pct/ratio calcs)
+      4. Default → empty string
+    """
     n = col.lower()
     if "date" in n or "time" in n or "_at" in n:
         return '"2020-01-01"'
-    if any(t in n for t in ("count", "qty", "quantity", "amount", "price", "id", "num", "score", "rate", "total", "sum", "rank")):
-        return "0"
     if "lat" in n:
         return "0.0"
     if "lon" in n or "lng" in n:
         return "0.0"
+    numeric_hints = (
+        "count", "qty", "quantity", "amount", "price", "id", "num", "score",
+        "rate", "total", "sum", "rank", "area", "sqmi", "sqkm", "sqft",
+        "distance", "miles", "km", "feet", "pct", "percent", "ratio",
+        "avg", "mean", "min", "max", "median", "stddev", "var",
+        "win", "lost", "loss", "lock", "size", "len", "length",
+        "year", "month", "day", "hour", "minute", "second",
+        "salary", "revenue", "profit", "loss", "cost", "value",
+    )
+    if any(t in n for t in numeric_hints):
+        # `1` not `0` so downstream `x / area` doesn't divide-by-zero.
+        return "1"
     return '""'
 
 

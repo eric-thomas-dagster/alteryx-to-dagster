@@ -98,6 +98,11 @@ def translate(alteryx_expr: str) -> ExprTranslation:
     # field name has spaces / punctuation — those need df["..."] wrapping
     # because pandas-eval rejects identifiers with non-identifier chars.
     if not _has_function_call(expr):
+        # ALWAYS apply operator replacements here too — AND/OR/NOT need to
+        # become &/|/~ regardless of which path we take below. The fast-path
+        # was previously skipping this and emitting Python `and` (which
+        # pandas eval rejects and Python eval treats as truth-value-of-Series).
+        expr = _apply_operator_replacements(expr)
         if _has_non_identifier_brackets(expr):
             return ExprTranslation(
                 pandas_expr=_wrap_brackets_for_python(expr),
@@ -768,11 +773,13 @@ def _t_pad_right(args: List[str]):
 
 @register("ToString")
 def _t_to_string(args: List[str]):
+    # ALWAYS wrap args[0] in parens before .astype — otherwise a multi-token
+    # arg like `x/y*100` becomes `x/y*100.astype(str)` where `100.astype` is
+    # parsed as a bad float literal. Same for ToNumber below.
     if len(args) == 1:
-        return f"{args[0]}.astype(str)", True, []
-    # Alteryx ToString(x, n) → numeric x to string with n decimal places.
+        return f"({args[0]}).astype(str)", True, []
     return (
-        f'{args[0]}.round({args[1]}).astype(str)',
+        f"({args[0]}).round({args[1]}).astype(str)",
         True,
         ["Alteryx ToString(x, n) — emitted as round(n).astype(str). May differ "
          "from Alteryx on trailing-zero formatting; tweak the format-spec by "
@@ -782,7 +789,7 @@ def _t_to_string(args: List[str]):
 
 @register("ToNumber")
 def _t_to_number(args: List[str]):
-    return f'pd.to_numeric({args[0]}, errors="coerce")', True, []
+    return f"pd.to_numeric(({args[0]}), errors='coerce')", True, []
 
 
 # ----------------------------------------------------------------- nulls

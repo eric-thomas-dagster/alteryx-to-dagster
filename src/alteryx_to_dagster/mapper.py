@@ -546,21 +546,26 @@ def _map_input_csv(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
         sheet_name = raw_sheet.rstrip("$") or None
 
     ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-    if ext == "parquet":
-        component_id, file_attr = "dataframe_from_parquet", "file_path"
-    elif ext in ("xlsx", "xls"):
-        # The registry doesn't currently ship a `dataframe_from_excel`
-        # source component (only the sink). Fall back to CSV — users
-        # convert Excel → CSV one-time before deploy. The sheet-name suffix
-        # we stripped above is lost, but for the common single-sheet case
-        # the conversion is `xlsx2csv` or `pandas.read_excel().to_csv()`.
-        component_id, file_attr = "dataframe_from_csv", "file_path"
-    elif ext == "yxdb":
-        component_id, file_attr = "dataframe_from_yxdb", "file_path"
-    else:
-        component_id, file_attr = "dataframe_from_csv", "file_path"
-
     notes = []
+    file_attr = "file_path"
+    extra_attrs: Dict[str, object] = {}
+
+    if ext == "parquet":
+        component_id = "dataframe_from_parquet"
+    elif ext in ("xlsx", "xls"):
+        # Use the registry's polymorphic file_ingestion source component —
+        # it handles Excel natively (and CSV / Parquet / JSON / etc. via
+        # format=auto on the extension). Stored sheet_name from the
+        # Alteryx `|||Sheet$` suffix flows through to read_excel().
+        component_id = "file_ingestion"
+        extra_attrs["format"] = "excel"
+        if sheet_name:
+            extra_attrs["sheet_name"] = sheet_name
+    elif ext == "yxdb":
+        component_id = "dataframe_from_yxdb"
+    else:
+        component_id = "dataframe_from_csv"
+
     if ext not in ("csv", "tsv", "txt", "parquet", "xlsx", "xls", "yxdb"):
         notes.append(
             f"Input Data on tool {node.tool_id}: unknown extension {ext!r}; "
@@ -569,9 +574,8 @@ def _map_input_csv(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
     attrs: Dict[str, object] = {
         file_attr: file_path,
         "group_name": "alteryx_imported",
+        **extra_attrs,
     }
-    if sheet_name and component_id == "dataframe_from_excel":
-        attrs["sheet_name"] = sheet_name
     return MappedTool(
         component_id=component_id,
         asset_name=_asset_name_for(node),
@@ -1930,18 +1934,19 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 # IS the data_cleansing component).
 
 _STOCK_MACRO_COMPONENTS: Dict[str, Any] = {
-    # Map lowercase basename → component-config dict. The dict's attrs get
-    # merged into the emitted defs.yaml; common ones already enabled.
+    # Map lowercase basename → component-config dict. Field names match the
+    # registry data_cleansing component's pydantic Field declarations
+    # (`null_handling` / `null_fill_value` / `trim_whitespace` /
+    # `normalize_case` / `remove_punctuation`), not Alteryx's per-checkbox
+    # flag names. Defaults model what Alteryx Cleanse does most of the
+    # time: trim whitespace + fill nulls with empty string (downstream
+    # numeric coerce produces NaN where needed).
     "cleanse.yxmc": {
         "component_id": "data_cleansing",
         "attributes": {
-            # Covers Replace Nulls + Trim Whitespace (the most common
-            # toggles on Cleanse). Override per-instance by editing the
-            # emitted defs.yaml if your usage differs.
             "trim_whitespace": True,
-            "remove_duplicate_whitespace": True,
-            "replace_nulls_string": True,
-            "replace_nulls_numeric": True,
+            "null_handling": "fill",
+            "null_fill_value": "",
         },
     },
 }

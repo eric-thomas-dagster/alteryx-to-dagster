@@ -50,6 +50,7 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "sql_transform": "SqlTransformComponent",
     # v0.5 additions
     "inline_dataframe": "InlineDataframeComponent",
+    "file_ingestion": "FileIngestionComponent",
     "data_cleansing": "DataCleansingComponent",
     "points_from_latlon": "PointsFromLatLonComponent",
     "drive_time": "DriveTimeComponent",
