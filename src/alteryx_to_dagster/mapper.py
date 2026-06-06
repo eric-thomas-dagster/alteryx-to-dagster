@@ -899,13 +899,19 @@ _ALTERYX_TO_PY_FORMAT: List[tuple[str, str]] = [
     ("yy", "%y"),
     ("MMMM", "%B"),
     ("MMM", "%b"),
+    # Alteryx also uses `Mon` / `MON` / `Month` for month names — same as MMM/MMMM
+    # in some non-canonical workflows. Order matters: must come before MM.
+    ("Month", "%B"),
+    ("MONTH", "%B"),
+    ("Mon", "%b"),
+    ("MON", "%b"),
     ("MM", "%m"),
     ("dddd", "%A"),
     ("ddd", "%a"),
     ("dd", "%d"),
     ("HH", "%H"),
     ("hh", "%I"),
-    ("mm", "%M"),  # only after MM/MMM/MMMM matched (minutes vs months)
+    ("mm", "%M"),  # only after MM/MMM/MMMM/Mon matched (minutes vs months)
     ("ss", "%S"),
     ("AM/PM", "%p"),
     ("AMPM", "%p"),

@@ -715,14 +715,17 @@ def _t_replace_first(args: List[str]):
 @register("ReplaceChar")
 def _t_replace_char(args: List[str]):
     """Alteryx ReplaceChar(s, find_chars, replace_char) — replaces EACH
-    character listed in `find_chars` with `replace_char`. Pandas equivalent
-    is `str.translate(str.maketrans(find_chars, replace_char * len(...)))`.
-    Handles the typical "strip these characters" use case (where replace_char
-    is empty)."""
+    character listed in `find_chars` with the single `replace_char` (or
+    deletes them if `replace_char` is "").
+
+    Use `str.translate(dict)` instead of `str.maketrans(a, b)` — the dict
+    form maps single-char ordinals to replacement strings (or None to
+    delete), and doesn't require source/target to be equal length.
+    """
     s, find_chars, repl = args[0], args[1], args[2]
     return (
-        f"{s}.apply(lambda v: str(v).translate(str.maketrans({find_chars}, "
-        f"({repl} * len({find_chars})) if len({repl}) == 1 else {repl})))",
+        f"({s}).apply(lambda v: str(v).translate("
+        f"{{ord(c): (({repl}) or None) for c in ({find_chars})}}))",
         True,
         [],
     )
