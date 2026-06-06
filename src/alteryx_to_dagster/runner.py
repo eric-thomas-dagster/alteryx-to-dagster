@@ -43,22 +43,45 @@ _FIELD_ELEMENT_RE = __import__("re").compile(
 )
 
 
-def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> list:
-    """Scan every downstream tool of `origin_tool_id` and return the
-    deduplicated list of column names they reference. Used by the
-    placeholder source emitter to size the stub schema."""
+def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> tuple:
+    """Scan downstream tools of `origin_tool_id` and return:
+
+      (column_names: list[str], string_typed_columns: set[str])
+
+    The second set lists columns the workflow's downstream tools use with
+    `.str.` accessors / Alteryx string functions (Trim, Replace, Substring,
+    UpperCase, LowerCase, Contains, StartsWith, Length, ToString) — those
+    MUST be typed as string in the placeholder stub or pandas raises
+    'Can only use .str accessor with string values'.
+    """
     import xml.etree.ElementTree as _ET
     by_id = wf.by_id()
     visited: set = set()
     stack = [e.dest_tool for e in wf.downstreams_of(origin_tool_id)]
     cols: set = set()
+    str_cols: set = set()
+
+    # Alteryx formula functions that take a string argument as their first
+    # operand. When we see e.g. `Trim([Pay Rate])`, the column "Pay Rate"
+    # must be string-typed in the placeholder stub.
+    _STRING_FNS = (
+        "trim", "trimleft", "trimright", "uppercase", "lowercase", "titlecase",
+        "left", "right", "substring", "length", "replace", "replacechar",
+        "replacefirst", "contains", "startswith", "endswith", "regex_replace",
+        "regex_match", "regex_countmatches", "findstring", "padleft",
+        "padright", "tostring", "isempty",
+    )
+    _STR_FN_RE = __import__("re").compile(
+        r"\b(?:" + "|".join(_STRING_FNS) + r")\s*\(\s*\[([^\[\]]+)\]",
+        __import__("re").IGNORECASE,
+    )
+
     while stack:
         tid = stack.pop()
         if tid in visited or tid not in by_id:
             continue
         visited.add(tid)
         node = by_id[tid]
-        # Stringify the node's configuration so the regex can scrape it.
         try:
             cfg_text = _ET.tostring(node.config, encoding="unicode")
         except Exception:
@@ -68,46 +91,45 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> list
         cols.update(_FIELD2_ATTR_RE.findall(cfg_text))
         cols.update(_EXPRESSION_ATTR_RE.findall(cfg_text))
         cols.update(_RENAME_ATTR_RE.findall(cfg_text))
-        # Element-text patterns: <InputFieldName>Date</InputFieldName>,
-        # <FieldFind>find</FieldFind>, <DateColumn>created_at</DateColumn>.
-        # findall returns (tag, text) tuples — take the text only.
         cols.update(text for _tag, text in _FIELD_ELEMENT_RE.findall(cfg_text))
-        # Don't walk Field name="..." for tools that DEFINE columns (TextInput).
-        # Recurse into THIS node's own downstreams (transitively).
+        # String-function detection — if Trim/Replace/etc. wraps a bracketed
+        # field anywhere in this tool's config, mark the column as string-typed.
+        for m in _STR_FN_RE.finditer(cfg_text):
+            str_cols.add(m.group(1))
         stack.extend(e.dest_tool for e in wf.downstreams_of(tid))
-    # Filter junk
     out: list = []
     for c in cols:
         if not c or "*" in c or "{" in c or "(" in c or c.startswith("\\") or len(c) > 80:
             continue
-        # Reject regex / expression noise
         if any(s in c for s in [">", "<", "&", "|", "=", "+", "-", "/", "*", '"', "'", "\n"]):
             continue
         if c not in out:
             out.append(c)
-    return out
+    return out, str_cols
 
 
-def _stub_value_literal_for(col: str) -> str:
+def _stub_value_literal_for(col: str, force_string: bool = False) -> str:
     """Pick a Python literal for a stub-row column based on the column name.
 
-    Mixed: columns whose names strongly suggest numeric use get an int
-    (so arithmetic works); columns whose names suggest text get a string
-    (so `.str.X` ops work). Date-like names get an ISO timestamp.
+    `force_string=True` overrides the heuristic and always returns a
+    string literal — used when downstream tools apply `.str.` accessors or
+    Alteryx string functions (Trim / Replace / Substring / etc.) to the
+    column, where a numeric value would crash with
+    'Can only use .str accessor with string values'.
 
-    Defaulting non-matches to strings keeps `.str.X` happy at the cost of
-    arithmetic on the few non-named-numeric columns that ARE numeric;
-    we surface this in MIGRATION.md.
+    Mixed (default): columns whose names strongly suggest numeric use get
+    an int (so arithmetic works); columns whose names suggest text get a
+    string (so `.str.X` ops work). Date-like names get an ISO timestamp.
     """
     n = col.lower()
     if "date" in n or "time" in n or "_at" in n:
         return '"2020-01-01"'
+    if force_string:
+        return '"1"'  # `"1"` parses to int via pd.to_numeric AND survives .str.X
     if "lat" in n:
         return "0.0"
     if "lon" in n or "lng" in n:
         return "0.0"
-    # Numeric-hinted names → int. Word-boundary match (suffix `_id` should
-    # count, but bare "id" inside `width` shouldn't).
     numeric_hints = (
         "count", "qty", "quantity", "amount", "price", "_id", "id_",
         "num", "score", "rate", "total", "sum", "rank",
@@ -117,13 +139,10 @@ def _stub_value_literal_for(col: str) -> str:
         "win", "lost", "loss", "size", "length",
         "year", "month", "day", "hour", "minute", "second",
         "salary", "revenue", "profit", "cost",
-        "lock",  # used in formula tests
+        "lock",
     )
     if any(t in n for t in numeric_hints):
         return "1"
-    # Default → empty-ish string so `.str.X` works. NOT `""` because
-    # pd.DataFrame(["", ...]) keeps as object but downstream pd.to_numeric
-    # produces NaN; "x" keeps as object AND coerces to NaN cleanly.
     return '"x"'
 
 
@@ -229,13 +248,16 @@ def import_workflow(
             return ph_name
         placeholder_assets_emitted.add(origin_tool_id)
 
-        cols = _columns_needed_downstream(wf, origin_tool_id)
+        cols, string_typed = _columns_needed_downstream(wf, origin_tool_id)
         if not cols:
             cols = ["col1", "col2", "col3"]  # safe non-empty default
 
-        # Synthesize a sensible single value per column (date-ish names get
-        # an ISO timestamp; id/count/qty get 0; lat/lon get 0.0; else "").
-        row_literal = "[" + ", ".join(_stub_value_literal_for(c) for c in cols) + "]"
+        # Per-column dtype hint: force string when downstream uses .str.X
+        # accessors / Alteryx string functions on that column.
+        row_literal = "[" + ", ".join(
+            _stub_value_literal_for(c, force_string=(c in string_typed))
+            for c in cols
+        ) + "]"
 
         py = f'''"""Placeholder for Alteryx tool {origin_tool_id} (was unmapped).
 
