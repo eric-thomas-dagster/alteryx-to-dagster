@@ -1178,17 +1178,38 @@ def _map_regex_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
         if not replacement and repl_attr_el.text:
             replacement = repl_attr_el.text.strip()
 
-    # ParseComplex == multi-group capture (extract); ParseSimple == split.
-    # Map Alteryx's method names onto regex_parser's mode field.
+    # Both ParseSimple and ParseComplex are EXTRACT operations in Alteryx —
+    # they apply the regex to the column and emit one output column per
+    # match group, named via <RootName>N or via explicit <ParseComplex>/<Field>
+    # entries. Tokenize is the only true split (one row per token).
     mode_map = {
         "parse": "extract",
         "parsecomplex": "extract",
-        "parsesimple": "split",
+        "parsesimple": "extract",
         "replace": "replace",
         "match": "match",
         "tokenize": "split",
     }
     mode = mode_map.get(method.lower(), "extract")
+
+    # ParseSimple's output columns are <RootName>1, <RootName>2, ...
+    # ParseComplex lists each output col explicitly via <Field field=X type=...>.
+    output_columns: List[str] = []
+    if method.lower() == "parsesimple":
+        ps_el = cfg.find("ParseSimple")
+        if ps_el is not None:
+            root_el = ps_el.find("RootName")
+            num_el = ps_el.find("NumFields")
+            root_name = root_el.text.strip() if root_el is not None and root_el.text else field_name
+            num_fields = int(num_el.attrib.get("value", "1")) if num_el is not None else 1
+            output_columns = [f"{root_name}{i + 1}" for i in range(num_fields)]
+    elif method.lower() == "parsecomplex":
+        pc_el = cfg.find("ParseComplex")
+        if pc_el is not None:
+            for fld in pc_el.findall("Field"):
+                fname = fld.attrib.get("field") or ""
+                if fname and fname != "No Marked Groups Found":
+                    output_columns.append(fname)
 
     attrs: Dict[str, object] = {
         "upstream_asset_key": _single_upstream(upstreams),
@@ -1200,8 +1221,13 @@ def _map_regex_tool(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     if mode == "replace":
         attrs["replacement"] = replacement
         attrs["output_column"] = new_field
-    elif mode in ("match", "extract"):
+    elif mode in ("match",):
         attrs["output_column"] = new_field
+    elif mode == "extract":
+        if output_columns:
+            attrs["output_columns"] = output_columns
+        else:
+            attrs["output_column"] = new_field
     return MappedTool(
         component_id="regex_parser",
         asset_name=_asset_name_for(node),
@@ -2140,6 +2166,51 @@ def _map_generate_rows(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
                 "Alteryx workflow — emitted as inline_dataframe with 10 sequential "
                 f"integer rows in column {field_name!r}. Edit `rows:` in defs.yaml "
                 "to match your Alteryx workflow's intended range."
+            ],
+        )
+
+    # Expression-driven loop expansion: Alteryx GenerateRows with Init/Cond/Loop
+    # expressions emits one new row per loop iteration per upstream row. Map
+    # to generate_rows component's loop_expression mode after translating each
+    # Alteryx expr to Python (bracketed [Col] → row['Col'], create field → value).
+    init_el = cfg.find("Expression_Init")
+    cond_el = cfg.find("Expression_Cond")
+    loop_el = cfg.find("Expression_Loop")
+    has_loop_form = (
+        init_el is not None and init_el.text and
+        cond_el is not None and cond_el.text and
+        loop_el is not None and loop_el.text
+    )
+    if has_loop_form:
+        from .expr_translator import translate as _expr_translate
+        def _xlate(raw: str) -> str:
+            # Bracket → row['X'] for upstream cols; bare field_name (the
+            # CreateField) → value (the loop variable).
+            t = _expr_translate(raw).pandas_expr
+            # Convert df["Col"] → row['Col'] (eval scope uses row dict).
+            t = re.sub(r"""df\[(['"])([^'"]+)\1\]""", r"row['\2']", t)
+            # Bare field_name not in brackets → value
+            t = re.sub(rf"\b{re.escape(field_name)}\b", "value", t)
+            return t
+
+        init_py = _xlate(init_el.text)
+        cond_py = _xlate(cond_el.text)
+        loop_py = _xlate(loop_el.text)
+        return MappedTool(
+            component_id="generate_rows",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": upstream,
+                "mode": "loop_expression",
+                "create_column": field_name,
+                "init_expression": init_py,
+                "condition_expression": cond_py,
+                "loop_expression": loop_py,
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"GenerateRows on tool {node.tool_id}: loop expansion. "
+                f"create_column={field_name!r}, init/cond/loop translated from Alteryx exprs."
             ],
         )
 
