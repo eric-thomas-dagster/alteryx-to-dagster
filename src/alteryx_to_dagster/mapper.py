@@ -2492,6 +2492,167 @@ def _map_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     )
 
 
+# Translation table for Alteryx MultiRowFormula's [Row±N:Col] references
+# → pandas equivalents. Each side of the table is the "Col" name.
+_ROW_REF_RE = re.compile(r"\[Row([+\-])(\d+):([^\]]+)\]")
+# Bare [Col] (no Row prefix) refers to this row's value of Col, including
+# the CreateField target itself (current row's value of the new column).
+_BARE_FIELD_RE = re.compile(r"\[([^\[\]]+)\]")
+
+
+def _translate_mrf_expression(expr: str, group_cols: List[str]) -> str:
+    """Translate an Alteryx MultiRowFormula expression to a pandas one.
+
+    [Row-1:X] / [Row+1:X] → df['X'].shift(1) / shift(-1)
+    [Row-N:X] / [Row+N:X] → shift(N) / shift(-N)
+    [X]                   → df['X']
+
+    When group_cols is non-empty, every shift becomes
+    df.groupby(group_cols)['X'].shift(...) so windows respect the partition.
+    """
+    grp = f"df.groupby({group_cols!r}, dropna=False)" if group_cols else None
+
+    # Single regex pass: match either [Row±N:Col] (with capture groups
+    # 1,2,3) or bare [Col] (group 4). Operating on the raw string in one
+    # sweep avoids re-matching the brackets we just emitted.
+    _MRF_TOKEN_RE = re.compile(
+        r"\[Row([+\-])(\d+):([^\]]+)\]"   # rowref groups 1, 2, 3
+        r"|\[([^\[\]]+)\]"                # bare col group 4
+    )
+
+    def _sub(m):
+        if m.group(1) is not None:
+            sign, n, col = m.group(1), int(m.group(2)), m.group(3)
+            shift_n = -n if sign == "+" else n
+            if grp:
+                return f"{grp}[{col!r}].shift({shift_n})"
+            return f"df[{col!r}].shift({shift_n})"
+        col = m.group(4)
+        return f"df[{col!r}]"
+
+    return _MRF_TOKEN_RE.sub(_sub, expr)
+
+
+_PURE_ROW_REF_RE = re.compile(r"^\s*\[Row([+\-])(\d+):([^\]]+)\]\s*$")
+
+
+def _map_multi_row_formula(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx MultiRowFormula → window_calculation when the expression is a
+    pure [Row±N:Col] reference, else formula component with a translated
+    pandas .shift() expression.
+
+    Reads:
+      <UpdateField value="True|False"/>
+      <UpdateField_Name>Col</UpdateField_Name>      (when updating)
+      <CreateField_Name>NewCol</CreateField_Name>   (when creating)
+      <Expression>[Row-1:Col]</Expression>
+      <GroupByFields><Field field="X"/></GroupByFields>
+    """
+    cfg = node.config
+    update_el = cfg.find("UpdateField")
+    is_update = update_el is not None and update_el.attrib.get("value", "False").lower() == "true"
+    if is_update:
+        upd_name_el = cfg.find("UpdateField_Name")
+        out_col = upd_name_el.text if upd_name_el is not None and upd_name_el.text else None
+    else:
+        crt_name_el = cfg.find("CreateField_Name")
+        out_col = crt_name_el.text if crt_name_el is not None and crt_name_el.text else None
+    expr_el = cfg.find("Expression")
+    raw_expr = (expr_el.text if expr_el is not None and expr_el.text else "").strip()
+
+    group_cols: List[str] = []
+    gbf = cfg.find("GroupByFields")
+    if gbf is not None:
+        for f in gbf.findall("Field"):
+            fn = f.attrib.get("field")
+            if fn:
+                group_cols.append(fn)
+
+    if not out_col or not raw_expr:
+        return MappedTool(
+            component_id="formula",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "expressions": {},
+                "group_name": "alteryx_imported",
+            },
+            notes=[f"MultiRowFormula on tool {node.tool_id}: no output column or expression — emitted empty."],
+        )
+
+    # Pure single-token [Row±N:Col]? Map to window_calculation.lag/lead.
+    pure = _PURE_ROW_REF_RE.match(raw_expr)
+    if pure:
+        sign, n, col = pure.group(1), int(pure.group(2)), pure.group(3)
+        func = "lag" if sign == "-" else "lead"
+        return MappedTool(
+            component_id="window_calculation",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "partition_by": group_cols or None,
+                "operations": [{
+                    "output": out_col,
+                    "func": func,
+                    "column": col,
+                    "periods": n,
+                }],
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"MultiRowFormula on tool {node.tool_id}: pure [Row{sign}{n}:{col}] mapped "
+                f"to window_calculation.{func}(periods={n})"
+                + (f" partitioned by {group_cols}" if group_cols else "")
+                + "."
+            ],
+        )
+
+    # Compound expression — run through expr_translator first (which handles
+    # IF/THEN/ELSE → np.where, operators, etc.), then post-process the
+    # df["Row±N:Col"] patterns it emits into proper .shift() calls.
+    from .expr_translator import translate as _expr_translate
+    pre = _expr_translate(raw_expr)
+    translated = pre.pandas_expr
+    grp = f"df.groupby({group_cols!r}, dropna=False)" if group_cols else None
+
+    def _shift_sub(m):
+        sign, n, col = m.group(1), int(m.group(2)), m.group(3)
+        shift_n = -n if sign == "+" else n
+        if grp:
+            return f"{grp}[{col!r}].shift({shift_n})"
+        return f"df[{col!r}].shift({shift_n})"
+
+    _DF_ROW_RE = re.compile(r"""df\[["']Row([+\-])(\d+):([^"']+)["']\]""")
+    translated = _DF_ROW_RE.sub(_shift_sub, translated)
+
+    # If anything remains as bare [Row±N:Col] (translator left it through),
+    # convert directly too.
+    translated = _ROW_REF_RE.sub(
+        lambda m: (
+            (f"{grp}[" if grp else "df[")
+            + repr(m.group(3))
+            + f"].shift({-int(m.group(2)) if m.group(1) == '+' else int(m.group(2))})"
+        ),
+        translated,
+    )
+
+    return MappedTool(
+        component_id="formula",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "expressions": {out_col: translated},
+            "group_name": "alteryx_imported",
+        },
+        notes=[
+            f"MultiRowFormula on tool {node.tool_id}: compound expression — translated "
+            f"IF/THEN/ELSE + [Row±N:Col] to np.where + df['Col'].shift(N)"
+            + (f" grouped by {group_cols}" if group_cols else "")
+            + "."
+        ],
+    )
+
+
 # ---------------------------------------------------------------- registry
 
 ToolMapping = Callable[[AlteryxNode, List[str]], MappedTool]
@@ -2630,27 +2791,7 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
             ],
         ))(node.config.find("RenameMode"), node.config.find("Prefix"), node.config.find("Suffix"))
     ),
-    "AlteryxBasePluginsGui.MultiRowFormula.MultiRowFormula": (
-        # Alteryx Multi-Row Formula uses [Row-1:Col] / [Row+1:Col] windowed
-        # references — pandas equivalent is df["Col"].shift(1) / .shift(-1).
-        # Best-effort: emit as a formula component with a TODO note; user
-        # rewrites the expression with .shift() semantics.
-        lambda node, upstreams: MappedTool(
-            component_id="formula",
-            asset_name=_asset_name_for(node),
-            attributes={
-                "upstream_asset_key": _single_upstream(upstreams),
-                "expressions": {},
-                "group_name": "alteryx_imported",
-            },
-            notes=[
-                f"MultiRowFormula on tool {node.tool_id}: Alteryx [Row-1:Col] / "
-                "[Row+1:Col] windowed references aren't auto-translated. Emitted "
-                "as empty formula — rewrite each output column using "
-                "`df['Col'].shift(N)` (pandas) syntax in defs.yaml's expressions dict."
-            ],
-        )
-    ),
+    "AlteryxBasePluginsGui.MultiRowFormula.MultiRowFormula": _map_multi_row_formula,
     "AlteryxConnectorGui.Download.Download": (
         # Alteryx Download → per_row_http_fetcher (per-row HTTP GET).
         lambda node, upstreams: MappedTool(
