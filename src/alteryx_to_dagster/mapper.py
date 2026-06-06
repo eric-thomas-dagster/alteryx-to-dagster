@@ -2211,6 +2211,84 @@ def _map_alteryx_macro(node: AlteryxNode, upstreams: List[str]):
     )
 
 
+def _predictive_y_x_vars(node: AlteryxNode) -> tuple:
+    """Extract Y Var (target) + X Vars (features, comma-separated) from
+    Alteryx Predictive XML config. Returns (target_col, feature_cols)."""
+    cfg = node.config
+    target = ""
+    features: List[str] = []
+    for v in cfg.findall("Value"):
+        name = v.attrib.get("name", "")
+        text = (v.text or "").strip() if v.text else ""
+        if name in ("Y Var", "Target", "Target_Variable", "target"):
+            target = text
+        elif name in ("X Vars", "Predictors", "X_Variables", "features"):
+            features = [c.strip() for c in text.split(",") if c.strip()]
+    return target, features
+
+
+def _make_predictive_mapper(component_id: str, task_type: Optional[str] = None):
+    """Build a mapper function for an Alteryx predictive plugin that targets
+    a sklearn-backed registry component with the standard predictive shape
+    (target_column + feature_columns + optional task_type)."""
+    def _mapper(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+        target, features = _predictive_y_x_vars(node)
+        attrs: Dict[str, object] = {
+            "upstream_asset_key": _single_upstream(upstreams),
+            "target_column": target,
+            "feature_columns": features,
+            "group_name": "alteryx_imported",
+        }
+        if task_type is not None:
+            attrs["task_type"] = task_type
+        return MappedTool(
+            component_id=component_id,
+            asset_name=_asset_name_for(node),
+            attributes=attrs,
+            notes=[
+                f"Predictive {node.plugin}: Alteryx-side hyperparameters "
+                "(regularization, CV folds, etc.) NOT translated — registry "
+                "component defaults apply. Tune in defs.yaml if needed."
+            ],
+        )
+    _mapper.__name__ = f"_map_predictive_{component_id}"
+    return _mapper
+
+
+def _map_score(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Score → `model_score` registry component.
+
+    Score has TWO upstreams: a fitted model + a DataFrame. The DataFrame
+    upstream is the one we wire as `upstream_asset_key`. The model is
+    expected at `model_path` (a local pickle/joblib file) — Alteryx
+    bundles it as a .yxdb model artifact, which doesn't translate; the
+    user needs to point at a serialized sklearn / statsmodels model file.
+    """
+    cfg = node.config
+    out_col = "predicted"
+    for v in cfg.findall("Value"):
+        if v.attrib.get("name") in ("Output Field", "Score Field"):
+            out_col = (v.text or "predicted").strip() if v.text else "predicted"
+    # Find features the upstream tools predicted on. Best effort.
+    return MappedTool(
+        component_id="model_score",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": upstreams[1] if len(upstreams) > 1 else _single_upstream(upstreams),
+            "model_path": "TODO_set_path_to_serialized_sklearn_or_statsmodels_model",
+            "feature_columns": [],
+            "output_column": out_col,
+            "group_name": "alteryx_imported",
+        },
+        notes=[
+            f"Score on tool {node.tool_id}: set `model_path` to a serialized "
+            "sklearn (joblib) or statsmodels (.save()) model file. Alteryx's "
+            "in-flow model passing doesn't translate — the upstream predictive "
+            "tool's `model_path` (if set) is the source path."
+        ],
+    )
+
+
 def _map_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Alteryx Select tool — keep/rename/reorder columns."""
     keep: List[str] = []
@@ -2264,6 +2342,68 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     "AlteryxBasePluginsGui.DataCleansing.DataCleansing": _map_data_cleansing,
     "AlteryxBasePluginsGui.GenerateRows.GenerateRows": _map_generate_rows,
     "AlteryxBasePluginsGui.FindReplace.FindReplace": _map_find_replace,
+    "AlteryxBasePluginsGui.DynamicRename.DynamicRename": (
+        # Alteryx Dynamic Rename: pattern-based column renaming (e.g. prefix all
+        # cols with "raw_", or take col names from another row of data).
+        # Map to select_columns with no explicit rename — the user fills in
+        # the rename pattern in the emitted defs.yaml.
+        lambda node, upstreams: MappedTool(
+            component_id="select_columns",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "rename": {},
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"DynamicRename on tool {node.tool_id}: Alteryx's pattern-based "
+                "renaming (use header row / prefix / suffix / regex) doesn't have "
+                "a 1:1 mapping. Emitted with empty `rename:` — fill in the column "
+                "name pairs explicitly in defs.yaml."
+            ],
+        )
+    ),
+    "AlteryxBasePluginsGui.MultiRowFormula.MultiRowFormula": (
+        # Alteryx Multi-Row Formula uses [Row-1:Col] / [Row+1:Col] windowed
+        # references — pandas equivalent is df["Col"].shift(1) / .shift(-1).
+        # Best-effort: emit as a formula component with a TODO note; user
+        # rewrites the expression with .shift() semantics.
+        lambda node, upstreams: MappedTool(
+            component_id="formula",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "expressions": {},
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"MultiRowFormula on tool {node.tool_id}: Alteryx [Row-1:Col] / "
+                "[Row+1:Col] windowed references aren't auto-translated. Emitted "
+                "as empty formula — rewrite each output column using "
+                "`df['Col'].shift(N)` (pandas) syntax in defs.yaml's expressions dict."
+            ],
+        )
+    ),
+    "AlteryxConnectorGui.Download.Download": (
+        # Alteryx Download → per_row_http_fetcher (per-row HTTP GET).
+        lambda node, upstreams: MappedTool(
+            component_id="per_row_http_fetcher",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "url_column": "URL",
+                "method": "GET",
+                "timeout_seconds": 30,
+                "output_prefix": "DownloadData",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Download on tool {node.tool_id}: defaults to url_column='URL' "
+                "and output_prefix='DownloadData' (Alteryx Download tool conventions). "
+                "Confirm URL column name + headers/auth in defs.yaml."
+            ],
+        )
+    ),
     # Aggregates / reshape
     "AlteryxBasePluginsGui.Summarize.Summarize": _map_summarize,
     # The spatial plugins ship their own Summarize engine that's wire-compatible
@@ -2288,6 +2428,33 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     # Spatial — drop-ins for Alteryx spatial tools
     "AlteryxSpatialPluginsGui.CreatePoints.CreatePoints": _map_create_points,
     "AlteryxSpatialPluginsGui.PolySplit.PolySplit": _map_poly_split,
+    # Data Investigation
+    "AlteryxBasePluginsGui.PearsonCorrelation.PearsonCorrelation": (
+        lambda node, upstreams: MappedTool(
+            component_id="pearson_correlation",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "output_shape": "long",
+                "group_name": "alteryx_imported",
+            },
+        )
+    ),
+    # Predictive — sklearn-backed registry components
+    "Linear_Regression": _make_predictive_mapper("linear_regression_model"),
+    "Logistic_Regression": _make_predictive_mapper("logistic_regression_model"),
+    "Decision_Tree": _make_predictive_mapper("decision_tree_model", task_type="classification"),
+    "Random_Forest": _make_predictive_mapper("random_forest_model", task_type="classification"),
+    "Naive_Bayes_Classifier": _make_predictive_mapper("naive_bayes_model", task_type="classification"),
+    "Neural_Network": _make_predictive_mapper("neural_network_model", task_type="classification"),
+    "Support_Vector_Machine": _make_predictive_mapper("svm", task_type="classification"),
+    "Boosted_Model": _make_predictive_mapper("gradient_boosting_model", task_type="regression"),
+    "Gradient_Boosted_Model": _make_predictive_mapper("gradient_boosting_model", task_type="regression"),
+    "Principal_Components": _make_predictive_mapper("pca"),
+    "Score": _map_score,
+    # Predictive — statsmodels-backed registry components
+    "Count_Regression": _make_predictive_mapper("count_regression"),
+    "Gamma_Regression": _make_predictive_mapper("gamma_regression"),
     # In-DB tools (multiple plugin namespaces in the wild — match all)
     "AlteryxConnectorsGui.InDbConnectionManager.InDbConnectionManager": _map_indb_connect,
     "AlteryxConnectorsGui.InDbInput.InDbInput": _map_indb_input,
