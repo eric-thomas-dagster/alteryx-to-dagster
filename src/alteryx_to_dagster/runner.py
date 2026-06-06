@@ -28,6 +28,70 @@ SCHEMA_URL_BASE = (
 )
 
 
+_BRACKETED_FIELD_RE = __import__("re").compile(r"\[([^\[\]]+)\]")
+_FIELD_ATTR_RE = __import__("re").compile(r"\bfield=\"([^\"]+)\"")
+_FIELD2_ATTR_RE = __import__("re").compile(r"\bfield2=\"([^\"]+)\"")
+_RENAME_ATTR_RE = __import__("re").compile(r"\brename=\"([^\"]+)\"")
+_EXPRESSION_ATTR_RE = __import__("re").compile(r"\bexpression=\"([^\"]+)\"")
+_NAME_ATTR_RE = __import__("re").compile(r"\bname=\"([^\"]+)\"")
+
+
+def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> list:
+    """Scan every downstream tool of `origin_tool_id` and return the
+    deduplicated list of column names they reference. Used by the
+    placeholder source emitter to size the stub schema."""
+    import xml.etree.ElementTree as _ET
+    by_id = wf.by_id()
+    visited: set = set()
+    stack = [e.dest_tool for e in wf.downstreams_of(origin_tool_id)]
+    cols: set = set()
+    while stack:
+        tid = stack.pop()
+        if tid in visited or tid not in by_id:
+            continue
+        visited.add(tid)
+        node = by_id[tid]
+        # Stringify the node's configuration so the regex can scrape it.
+        try:
+            cfg_text = _ET.tostring(node.config, encoding="unicode")
+        except Exception:
+            cfg_text = ""
+        cols.update(_BRACKETED_FIELD_RE.findall(cfg_text))
+        cols.update(_FIELD_ATTR_RE.findall(cfg_text))
+        cols.update(_FIELD2_ATTR_RE.findall(cfg_text))
+        cols.update(_EXPRESSION_ATTR_RE.findall(cfg_text))
+        cols.update(_RENAME_ATTR_RE.findall(cfg_text))
+        # Don't walk Field name="..." for tools that DEFINE columns (TextInput).
+        # Recurse into THIS node's own downstreams (transitively).
+        stack.extend(e.dest_tool for e in wf.downstreams_of(tid))
+    # Filter junk
+    out: list = []
+    for c in cols:
+        if not c or "*" in c or "{" in c or "(" in c or c.startswith("\\") or len(c) > 80:
+            continue
+        # Reject regex / expression noise
+        if any(s in c for s in [">", "<", "&", "|", "=", "+", "-", "/", "*", '"', "'", "\n"]):
+            continue
+        if c not in out:
+            out.append(c)
+    return out
+
+
+def _stub_value_literal_for(col: str) -> str:
+    """Pick a Python literal value for a stub-row column based on the
+    column name. Returns a string that can be embedded directly in `repr`."""
+    n = col.lower()
+    if "date" in n or "time" in n or "_at" in n:
+        return '"2020-01-01"'
+    if any(t in n for t in ("count", "qty", "quantity", "amount", "price", "id", "num", "score", "rate", "total", "sum", "rank")):
+        return "0"
+    if "lat" in n:
+        return "0.0"
+    if "lon" in n or "lng" in n:
+        return "0.0"
+    return '""'
+
+
 def _topo_sort(wf: AlteryxWorkflow) -> List[AlteryxNode]:
     """Kahn's algorithm — Alteryx workflows are DAGs by construction."""
     incoming: Dict[str, int] = {n.tool_id: 0 for n in wf.nodes}
@@ -112,6 +176,54 @@ def import_workflow(
     component_ids_used: List[str] = []
     files_written: List[Path] = []
 
+    placeholder_assets_emitted: set = set()  # tool_ids we've stubbed a source for
+
+    def _emit_placeholder_source(origin_tool_id: str) -> str:
+        """When the upstream node was unmapped, emit a placeholder source
+        asset that returns a one-row DataFrame whose columns match what
+        downstream consumers reference. Lets downstream assets actually
+        execute on the stub rather than KeyError on the first column lookup.
+
+        Column extraction: walks the parser's edge list to find every
+        downstream node consuming this tool, then scrapes column references
+        from each downstream node's <Configuration> XML — bracketed `[Field]`,
+        Sort/Summarize/Select `field=` attrs, etc.
+        """
+        ph_name = f"unmapped_upstream_for_tool_{origin_tool_id}"
+        if origin_tool_id in placeholder_assets_emitted:
+            return ph_name
+        placeholder_assets_emitted.add(origin_tool_id)
+
+        cols = _columns_needed_downstream(wf, origin_tool_id)
+        if not cols:
+            cols = ["col1", "col2", "col3"]  # safe non-empty default
+
+        # Synthesize a sensible single value per column (date-ish names get
+        # an ISO timestamp; id/count/qty get 0; lat/lon get 0.0; else "").
+        row_literal = "[" + ", ".join(_stub_value_literal_for(c) for c in cols) + "]"
+
+        py = f'''"""Placeholder for Alteryx tool {origin_tool_id} (was unmapped).
+
+The original Alteryx tool's mapping wasn't found in alteryx_to_dagster.mapper.
+This stub returns a 1-row DataFrame whose schema matches what downstream
+tools reference, so the graph at least loads + executes. Replace this with
+the real tool's logic (see MIGRATION.md).
+"""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={ph_name!r},
+    group_name="alteryx_unmapped",
+    description="Placeholder for unmapped Alteryx tool {origin_tool_id}. Replace.",
+)
+def {ph_name}() -> pd.DataFrame:
+    return pd.DataFrame([{row_literal}], columns={cols!r})
+'''
+        emit_inline_python(out_dir, pkg, ph_name, py)
+        return ph_name
+
     for node in ordered:
         # Resolve upstreams in connection-anchor order so e.g. Join's Left/Right
         # arrive deterministically.
@@ -119,14 +231,22 @@ def import_workflow(
             wf.upstreams_of(node.tool_id),
             key=lambda e: (e.dest_anchor, e.origin_tool),
         )
-        upstreams = [tool_to_asset.get(e.origin_tool, "") for e in incoming_edges]
+        upstreams: List[str] = []
+        for e in incoming_edges:
+            up = tool_to_asset.get(e.origin_tool, "")
+            if not up:
+                # Upstream node wasn't mapped — emit a placeholder so the
+                # downstream asset still resolves at build time.
+                up = _emit_placeholder_source(e.origin_tool)
+                tool_to_asset[e.origin_tool] = up  # cache so siblings share
+            upstreams.append(up)
 
         result = map_tool(node, upstreams, translator=translator)
         if isinstance(result, UnmappedTool):
             unmapped_results.append((node.tool_id, node.plugin, result.reason, result.suggestion))
-            # We can't link downstreams to a missing asset — leave tool_to_asset empty
-            # for this tool. Downstream tools that consume it will get "" as their
-            # upstream and the user will see the gap when they try to materialize.
+            # Don't record into tool_to_asset — downstream tools that
+            # consume this will trigger _emit_placeholder_source on their
+            # own incoming-edge walk.
             continue
 
         assert isinstance(result, MappedTool)

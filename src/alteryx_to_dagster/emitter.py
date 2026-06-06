@@ -93,10 +93,24 @@ def emit_yaml(
     # it in unless the caller already supplied one in `attributes`.
     merged_attrs = dict(attributes)
     merged_attrs.setdefault("asset_name", asset_name)
+    # Preserve required-shape keys (upstream/left/right/asset_key etc.) even
+    # when their value is "" — dropping them causes pydantic ValidationErrors
+    # at component construction. An empty string is visible to the user as
+    # "this upstream wasn't mapped" and the run still loads; dropping the
+    # field entirely makes the whole project fail to load.
+    _STRUCTURAL_KEYS = {
+        "upstream_asset_key", "left_asset_key", "right_asset_key",
+        "upstream_asset_key_target", "upstream_asset_key_source",
+        "points_asset_key", "regions_asset_key",
+        "asset_name",
+    }
     body = {
         "type": type_line,
-        # Drop None / "" values so YAML stays clean.
-        "attributes": {k: v for k, v in merged_attrs.items() if v is not None and v != ""},
+        "attributes": {
+            k: v
+            for k, v in merged_attrs.items()
+            if k in _STRUCTURAL_KEYS or (v is not None and v != "")
+        },
     }
     header = ""
     if schema_url:

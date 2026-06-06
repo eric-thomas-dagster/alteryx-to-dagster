@@ -88,6 +88,11 @@ def translate(alteryx_expr: str) -> ExprTranslation:
     # that isn't part of `==`, `<=`, `>=`, `!=` to `==`.
     expr = _convert_alteryx_equality(expr)
 
+    # Pre-pass: rewrite Alteryx's `IF cond THEN a ELSEIF cond2 THEN b ELSE c ENDIF`
+    # multi-arm conditional to nested IIF() calls so the function translator
+    # picks them up. Handles ELSEIF chains by recursively wrapping.
+    expr = _convert_alteryx_if_then(expr)
+
     # First pass: if no function calls at all, this is bracket-stripping +
     # operator passthrough. Doesn't need PYTHON path UNLESS a bracketed
     # field name has spaces / punctuation — those need df["..."] wrapping
@@ -138,6 +143,104 @@ def _has_non_identifier_brackets(expr: str) -> bool:
         if not _IDENTIFIER_RE.match(m.group(1)):
             return True
     return False
+
+
+_IF_TOKEN_RE = re.compile(r"\b(IF|THEN|ELSEIF|ELSE|ENDIF)\b", re.IGNORECASE)
+
+
+def _convert_alteryx_if_then(expr: str) -> str:
+    """Rewrite Alteryx-style `IF cond THEN a ELSEIF cond2 THEN b ELSE c ENDIF`
+    into nested IIF() calls so the function-call translator handles them.
+
+    `IF a THEN x ELSE y ENDIF` → `IIF(a, x, y)`
+    `IF a THEN x ELSEIF b THEN y ELSE z ENDIF` → `IIF(a, x, IIF(b, y, z))`
+
+    Walks until no `IF...ENDIF` remains (handles nesting by repeated single-pass).
+    """
+    # Strip string-literal contents from a copy used for token-finding;
+    # match offsets are valid against the original expr.
+    sentinel = _strip_string_literals(expr)
+    # Find the LAST `IF` (so we transform innermost-first when there's nesting).
+    while True:
+        if_matches = list(re.finditer(r"\bIF\b", sentinel, re.IGNORECASE))
+        if not if_matches:
+            break
+        if_m = if_matches[-1]
+        # Find the matching ENDIF after this IF.
+        endif_m = re.search(r"\bENDIF\b", sentinel[if_m.end():], re.IGNORECASE)
+        if not endif_m:
+            break
+        block_start = if_m.start()
+        block_end = if_m.end() + endif_m.end()
+        block = expr[block_start: block_end]
+        rewritten = _if_block_to_iif(block)
+        if rewritten is None:
+            # Malformed — leave as-is to surface as untranslatable.
+            break
+        expr = expr[:block_start] + rewritten + expr[block_end:]
+        sentinel = sentinel[:block_start] + rewritten + sentinel[block_end:]
+    return expr
+
+
+def _if_block_to_iif(block: str) -> Optional[str]:
+    """Convert a single `IF ... ENDIF` block into nested `IIF(...)` calls.
+
+    Top-level tokens (split outside string literals): IF, THEN, ELSEIF,
+    ELSE, ENDIF. Order is strict.
+    """
+    # Tokenize at top level only. Strip the outer IF...ENDIF.
+    stripped = _strip_string_literals(block)
+    # Drop the leading IF and trailing ENDIF.
+    body_m = re.match(r"\s*IF\b(.+)\bENDIF\s*$", stripped, re.IGNORECASE | re.DOTALL)
+    if not body_m:
+        return None
+    body_start = body_m.start(1)
+    body_end = body_m.end(1)
+    body = block[body_start: body_end]
+
+    # Split on top-level THEN / ELSEIF / ELSE tokens.
+    tokens = []  # list of (kind, text)
+    sentinel = _strip_string_literals(body)
+    pos = 0
+    for m in re.finditer(r"\b(THEN|ELSEIF|ELSE)\b", sentinel, re.IGNORECASE):
+        tokens.append(("expr", body[pos: m.start()]))
+        tokens.append((m.group(1).upper(), ""))
+        pos = m.end()
+    tokens.append(("expr", body[pos:]))
+
+    # Build sequence: cond1, then1, [cond2, then2, ...], default
+    conds: list = []
+    thens: list = []
+    default: str = "None"
+    i = 0
+    while i < len(tokens):
+        kind, text = tokens[i]
+        if kind == "expr" and i == 0:
+            # First condition
+            conds.append(text.strip())
+            i += 1
+            continue
+        if kind == "THEN" and i + 1 < len(tokens):
+            thens.append(tokens[i + 1][1].strip())
+            i += 2
+            continue
+        if kind == "ELSEIF" and i + 1 < len(tokens):
+            conds.append(tokens[i + 1][1].strip())
+            i += 2
+            continue
+        if kind == "ELSE" and i + 1 < len(tokens):
+            default = tokens[i + 1][1].strip()
+            i += 2
+            continue
+        i += 1
+
+    if len(conds) != len(thens) or not conds:
+        return None
+    # Nest right-to-left: IIF(c1, t1, IIF(c2, t2, ..., default))
+    result = default
+    for c, t in zip(reversed(conds), reversed(thens)):
+        result = f"IIF({c}, {t}, {result})"
+    return result
 
 
 def _convert_alteryx_equality(expr: str) -> str:
@@ -791,3 +894,129 @@ def _t_dt_minute(args: List[str]):
 @register("DateTimeSecond")
 def _t_dt_second(args: List[str]):
     return f"{args[0]}.dt.second", True, []
+
+
+# ------------------------------------------------------------- math
+#
+# Alteryx math functions map to numpy / pandas equivalents. All emit
+# PYTHON-path expressions (np.sqrt etc.) so the registry's formula
+# component's eval-fallback executes them with np in scope.
+
+@register("SQRT")
+def _t_sqrt(args: List[str]):
+    return f"np.sqrt({args[0]})", True, []
+
+
+@register("ABS")
+def _t_abs(args: List[str]):
+    return f"np.abs({args[0]})", True, []
+
+
+@register("LOG")
+def _t_log(args: List[str]):
+    return f"np.log({args[0]})", True, []
+
+
+@register("LOG10")
+def _t_log10(args: List[str]):
+    return f"np.log10({args[0]})", True, []
+
+
+@register("EXP")
+def _t_exp(args: List[str]):
+    return f"np.exp({args[0]})", True, []
+
+
+@register("POW")
+def _t_pow(args: List[str]):
+    return f"np.power({args[0]}, {args[1]})", True, []
+
+
+@register("CEIL")
+def _t_ceil(args: List[str]):
+    return f"np.ceil({args[0]})", True, []
+
+
+@register("FLOOR")
+def _t_floor(args: List[str]):
+    return f"np.floor({args[0]})", True, []
+
+
+@register("ROUND")
+def _t_round(args: List[str]):
+    """Alteryx ROUND(x, multiple) → round x to the nearest multiple. The
+    common case is `ROUND(x, 0.01)`, equivalent to Python `round(x, 2)`."""
+    if len(args) == 1:
+        return f"np.round({args[0]})", True, []
+    return f"({args[0]} / {args[1]}).round() * {args[1]}", True, []
+
+
+@register("MIN")
+def _t_min(args: List[str]):
+    if len(args) == 1:
+        return f"{args[0]}.min()", True, []
+    return f"np.minimum.reduce([{', '.join(args)}])", True, []
+
+
+@register("MAX")
+def _t_max(args: List[str]):
+    if len(args) == 1:
+        return f"{args[0]}.max()", True, []
+    return f"np.maximum.reduce([{', '.join(args)}])", True, []
+
+
+@register("MOD")
+def _t_mod(args: List[str]):
+    return f"({args[0]} % {args[1]})", True, []
+
+
+@register("AVG")
+def _t_avg(args: List[str]):
+    return f"{args[0]}.mean()", True, []
+
+
+@register("SUM")
+def _t_sum(args: List[str]):
+    return f"{args[0]}.sum()", True, []
+
+
+@register("MEDIAN")
+def _t_median(args: List[str]):
+    return f"{args[0]}.median()", True, []
+
+
+@register("COUNT")
+def _t_count(args: List[str]):
+    return f"{args[0]}.count()", True, []
+
+
+@register("PI")
+def _t_pi(_args: List[str]):
+    return "np.pi", True, []
+
+
+@register("RAND")
+def _t_rand(_args: List[str]):
+    return "np.random.random()", True, []
+
+
+@register("RANDINT")
+def _t_randint(args: List[str]):
+    if len(args) == 1:
+        return f"np.random.randint(0, {args[0]})", True, []
+    return f"np.random.randint({args[0]}, {args[1]})", True, []
+
+
+# ------------------------------------------------------------- spatial / null helpers
+
+@register("Coalesce")
+def _t_coalesce(args: List[str]):
+    """Alteryx Coalesce returns the first non-null arg. fillna chain works
+    for Series; np.where for scalars/arrays."""
+    if len(args) == 1:
+        return args[0], True, []
+    # Chain .fillna(...) right-to-left so the first non-null wins.
+    expr = args[-1]
+    for a in reversed(args[:-1]):
+        expr = f"({a}).fillna({expr})"
+    return expr, True, []

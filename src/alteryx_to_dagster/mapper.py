@@ -549,7 +549,12 @@ def _map_input_csv(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
     if ext == "parquet":
         component_id, file_attr = "dataframe_from_parquet", "file_path"
     elif ext in ("xlsx", "xls"):
-        component_id, file_attr = "dataframe_from_excel", "file_path"
+        # The registry doesn't currently ship a `dataframe_from_excel`
+        # source component (only the sink). Fall back to CSV — users
+        # convert Excel → CSV one-time before deploy. The sheet-name suffix
+        # we stripped above is lost, but for the common single-sheet case
+        # the conversion is `xlsx2csv` or `pandas.read_excel().to_csv()`.
+        component_id, file_attr = "dataframe_from_csv", "file_path"
     elif ext == "yxdb":
         component_id, file_attr = "dataframe_from_yxdb", "file_path"
     else:
@@ -1525,15 +1530,29 @@ def _map_running_total(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
             fn = f.attrib.get("field")
             if fn:
                 group_by.append(fn)
+    # RunningTotalComponent takes ONE value_column. Alteryx allows multiple
+    # accumulator columns per tool — if we got multiple, emit the first and
+    # surface the rest in MIGRATION.md (user should split into N RunningTotal
+    # tools, one per column).
+    primary = fields[0] if fields else ""
+    notes = []
+    if len(fields) > 1:
+        notes.append(
+            f"RunningTotal on tool {node.tool_id} accumulated multiple "
+            f"columns ({fields}); registry's running_total takes ONE "
+            f"value_column. Emitted for {primary!r}; add separate tools "
+            f"for {fields[1:]}."
+        )
     return MappedTool(
         component_id="running_total",
         asset_name=_asset_name_for(node),
         attributes={
             "upstream_asset_key": _single_upstream(upstreams),
-            "columns": fields,
-            "group_by": group_by,
+            "value_column": primary,
+            "group_by": group_by or None,
             "group_name": "alteryx_imported",
         },
+        notes=notes,
     )
 
 
@@ -1582,10 +1601,16 @@ def _map_cross_tab(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
         asset_name=_asset_name_for(node),
         attributes={
             "upstream_asset_key": _single_upstream(upstreams),
-            "index": group_by,
-            "columns": header_field,
-            "values": value_field,
-            "aggfunc": method,
+            # Registry's PivotComponent field names — these don't match pandas
+            # (or what _map_cross_tab emitted in v0.4). Spec:
+            #   index_columns: List[str] → group keys that stay as rows
+            #   pivot_column: str        → column whose values become new headers
+            #   value_column: str        → column whose values fill the pivoted cells
+            #   agg_func: str            → 'sum' / 'mean' / 'count' / 'min' / 'max' / 'first' / 'last'
+            "index_columns": group_by,
+            "pivot_column": header_field,
+            "value_column": value_field,
+            "agg_func": method,
             "group_name": "alteryx_imported",
         },
     )
@@ -1609,8 +1634,10 @@ def _map_transpose(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
         asset_name=_asset_name_for(node),
         attributes={
             "upstream_asset_key": _single_upstream(upstreams),
-            "id_vars": key_fields,
-            "value_vars": data_fields,
+            # Registry's UnpivotComponent uses id_columns / value_columns
+            # (pandas-style id_vars / value_vars renamed for component clarity).
+            "id_columns": key_fields,
+            "value_columns": data_fields or None,
             "var_name": "Name",
             "value_name": "Value",
             "group_name": "alteryx_imported",
