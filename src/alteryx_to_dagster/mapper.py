@@ -2767,7 +2767,11 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
         # SpatialMatch: point-in-polygon test (or geometry intersection).
         # Maps to spatial_join (two-input: points + regions). Falls back to
         # point_in_polygon when there's only one upstream.
-        lambda node, upstreams: MappedTool(
+        # Read <Target SpatialObj="X"/> and <Universe SpatialObj="Y"/> to
+        # detect when upstream emits a Shapely geom column directly (PolyBuild,
+        # CreatePoints, geocoder) — pass it as points_geometry_column instead
+        # of relying on lat/lng numerics.
+        lambda node, upstreams: (lambda tgt_el, uni_el: MappedTool(
             component_id="spatial_join" if len(upstreams) > 1 else "point_in_polygon",
             asset_name=_asset_name_for(node),
             attributes=(
@@ -2776,6 +2780,12 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
                     "regions_asset_key": upstreams[1],
                     "lat_column": "latitude",
                     "lng_column": "longitude",
+                    "points_geometry_column": (
+                        tgt_el.attrib.get("SpatialObj") if tgt_el is not None else None
+                    ),
+                    "geometry_column": (
+                        uni_el.attrib.get("SpatialObj", "geometry") if uni_el is not None else "geometry"
+                    ),
                     "group_name": "alteryx_imported",
                 }
                 if len(upstreams) > 1
@@ -2794,7 +2804,7 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
                 "point_in_polygon, set geojson_path or geojson_url to the "
                 "polygon source."
             ],
-        )
+        ))(node.config.find("Target"), node.config.find("Universe"))
     ),
     "AlteryxSpatialPluginsGui.PolyBuild.PolyBuild": (
         # PolyBuild → poly_build component. Alteryx config:
