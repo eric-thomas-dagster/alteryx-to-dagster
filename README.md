@@ -2,9 +2,9 @@
 
 Convert Alteryx workflows (`.yxmd` / `.yxmz` / `.yxzp`) into runnable Dagster projects.
 
-Each Alteryx tool becomes a Dagster asset, wired into the DAG via `deps`, using the [Dagster community components registry](https://dagster-component-ui.vercel.app/) as the transform vocabulary (`filter`, `summarize`, `dataframe_join`, `formula`, `sort`, `unique_dedup`, `pivot`, `unpivot`, `running_total`, `record_id`, the `dataframe_*` IO family, `sql_transform`, …). Tools without a 1:1 mapping land in `MIGRATION.md` for manual review.
+Each Alteryx tool becomes a Dagster asset, wired into the DAG via `deps`, using the [Dagster community components registry](https://dagster-component-ui.vercel.app/) as the transform vocabulary (`filter`, `summarize`, `dataframe_join`, `formula`, `sort`, `unique_dedup`, `pivot`, `unpivot`, `running_total`, `window_calculation`, the `dataframe_*` IO family, `sql_transform`, the spatial + predictive families, …).
 
-Standalone CLI — **does not require an Alteryx Designer install or any Alteryx license**. The deterministic translator covers ~40 Alteryx-only formula functions; LLM is an opt-in fallback for the long tail.
+Standalone CLI — **does not require an Alteryx Designer install or any Alteryx license**. Translation is deterministic; LLM is an opt-in fallback for the long tail.
 
 ## Install + use
 
@@ -31,50 +31,54 @@ uv run dg check defs            # all generated YAML loads cleanly
 uv run dg dev                   # asset graph at http://localhost:3000
 ```
 
-The `--install` flag shells out to `dagster-component add <id> --auto-install` for every registry component the importer used. Without it you'll see a printed list of `add` commands to run yourself.
+The `--install` flag shells out to `dagster-component add <id> --auto-install` for every registry component the importer used.
 
-## What it can do today
+## Tool coverage
 
-### Tool coverage
-
-| Category | Alteryx tools handled | Maps to |
+| Category | Alteryx tools | Maps to |
 |---|---|---|
-| **Inputs** | Text Input · Input Data | inline `@dg.asset` (Text Input keeps field-typed dtypes) · `dataframe_from_csv` / `_parquet` / `_excel` / **`dataframe_from_yxdb` (native binary)** — sniffed by file extension |
-| **Outputs** | Output Data · Browse | `dataframe_to_csv` / `_excel` / `_parquet` — sniffed by extension; Browse is a no-op (Dagster UI previews assets automatically) |
-| **Row / column** | Filter · Select · Sort · Unique · Sample · Date Filter · Tile | `filter` · `select_columns` · `sort` · `unique_dedup` · `sample` (random) or inline pandas `.head`/`.tail`/`.iloc` (FirstN/LastN/EveryNth) · `filter` with between predicate · `pd.qcut`/`pd.cut` |
-| **Transforms** | Formula · Multi-Field Formula · Record ID · Running Total · Data Cleansing | `formula` (pandas-eval) or inline `np.where`/`.str.*`/`.dt.*` when needed · `multi_field_formula` · `record_id` · `running_total` · inline pandas |
-| **Aggregates / reshape** | Summarize · Count Records · CrossTab · Transpose | `summarize` (with named-agg rename) · `summarize` size · `pivot` · `unpivot` |
-| **Parse** | DateTime · Regex (Parse/Replace/Match/Tokenize) · JSON Parse · XML Parse · Text To Columns | inline pandas — `pd.to_datetime` / `.dt.strftime` · `.str.replace`/`extract`/`match`/`split` · `pd.json_normalize` · `xml.etree`-based parser · `.str.split(expand=True)` |
-| **Multi-input** | Join · Join Multiple · Union · Append · Append Fields | `dataframe_join` · inline pandas chained `.merge()` · `dataframe_union` · alias · `append_fields` (cartesian) |
-| **In-DB** (SQL pushdown) | Connect · Input · Filter · Formula · Select · Summarize · Join · Union · Sample · Stream Out · Write Data | each tool → one `sql_transform` asset that CTASs an intermediate table. Connection routed via an env var slugified from the Alteryx `<Connection>` name (e.g. `Snowflake_Prod` → `SNOWFLAKE_PROD_URL`). |
-| **Control flow** | Block Until Done · Cache Dataset · Browse · Message · Detour | dropped with a MIGRATION.md note — Dagster's DAG / IO manager / `AutomationCondition` already provides each of these natively |
+| **Inputs** | Text Input · Input Data | `inline_dataframe` (preserves declared dtypes; auto-infers V_String numerics; leading-zero strings stay strings) · `dataframe_from_csv` / `_parquet` / `_excel` / **`dataframe_from_yxdb` (native binary)** — sniffed by file extension |
+| **Outputs** | Output Data · Browse · Render · PortfolioComposer Image | `dataframe_to_csv` / `_excel` / `_parquet` · `pdf_report` · Browse → no-op (Dagster UI previews assets automatically) |
+| **Row / column** | Filter · Select · AlteryxSelect · Sort · Unique · Sample · Date Filter · Tile · DynamicRename · BlobConvert | `filter` · `select_columns` (handles `*Unknown` wildcard) · `sort` · `unique_dedup` · `sample` · `filter` w/ between predicate · `tile_binning` · `dynamic_rename` · `blob_convert` |
+| **Transforms** | Formula · Multi-Field Formula · Multi-Row Formula · Record ID · Running Total · Data Cleansing | `formula` (pandas-eval or PYTHON path) · `multi_field_formula` · pure `[Row±N:Col]` → `window_calculation` (lag/lead); compound IF/THEN/ELSE → `formula` with translated `df['Col'].shift(N)` · `record_id` · `running_total` · `data_cleansing` |
+| **Aggregates / reshape** | Summarize · Count Records · CrossTab · Transpose | `summarize` (with named-agg rename, object-dtype coercion for arithmetic aggs, whole-frame fallback) · `summarize` size · `pivot` · `unpivot` |
+| **Parse** | DateTime · Regex (Parse Simple / Parse Complex / Replace / Match / Tokenize) · JSON Parse · XML Parse · Text To Columns | `datetime_parser` (whitespace-tolerant) · `regex_parser` (ParseSimple → `extract` w/ `RootName1…N` output cols, auto-wraps groupless patterns) · `json_flatten` · `xml_parser` · `text_to_columns` |
+| **Multi-input** | Join · Join Multiple · Union · Append · Append Fields · Find Replace | `dataframe_join` (forwards embedded `<SelectFields/>` as post-merge `rename` / `drop_columns` with fuzzy `Right_`/`Left_` prefix matching; coalesces mismatched join-key dtypes) · inline pandas chained `.merge()` · `dataframe_union` · alias · `append_fields` · `find_replace` |
+| **GenerateRows** | per-row Expression_Init/Cond/Loop expansion | `generate_rows` mode `loop_expression` — emits one row per loop iteration; integer / date / datetime stepping all work |
+| **Spatial** | Create Points · Geo Buffer · Geo Overlay · Geo Simplify · Drive Time · Poly Split · **Spatial Match** · **Distance** · **Find Nearest** · **Poly Build** · **Spatial Info** · **Map Input** · **Trade Area** | `points_from_latlon` · `geo_buffer` · `geo_overlay` · `geo_simplify` · `drive_time` (openrouteservice / google / mapbox / osrm) · `poly_split` · `spatial_join` (accepts pre-built geom column on points side) · `distance_calculator` · `nearest_neighbors` (auto-explodes Point feature cols; FindNearest's k=1 distance → `DistanceMiles`) · `poly_build` (geom-col input mode for `<SpatialObj/>`) · `spatial_info` · `file_ingestion` · `drive_time` w/ travel-mode profile |
+| **Predictive** | Linear / Logistic / Decision Tree / Random Forest / Naive Bayes / Neural Network / SVM / Gradient Boosting / PCA / Score | sklearn-backed registry components w/ `model_path` joblib save; Score loads a saved model and predicts |
+| **Time Series** | TS Forecast / TS Plot | `arima_forecast` · `ets_forecast` |
+| **In-DB** (SQL pushdown) | Connect · Input · Filter · Formula · Select · Summarize · Join · Union · Sample · Stream Out · Write Data | each tool → one `sql_transform` asset that CTASs an intermediate table. Connection routed via an env var slugified from the Alteryx `<Connection>` name (e.g. `Snowflake_Prod` → `SNOWFLAKE_PROD_URL`). **Not yet:** collapsing connected In-DB subgraphs into a single `warehouse_pipeline` CTE chain — that preserves Alteryx's single-query pushdown and lets In-DB Stream Out route via `warehouse_pipeline.return_dataframe=True`. The corpus we test against has no In-DB workflows so this hasn't shipped yet. |
+| **Macros (`.yxmc`)** | Custom macros · stock macros (Cleanse) | `macro_splicer.py` recursively inlines `.yxmc` (max depth 5), renumbers tool_ids with `m<parent>_` prefix, rewires Macro Input/Output anchors. Stock macros (Cleanse, etc.) route to dedicated registry components instead of inlining. |
+| **Control flow** | Block Until Done · Cache Dataset · Browse · Message · Detour · Tool Container · Comment · Text Box · HTMLBox | Skipped (Dagster's DAG / IO manager / `AutomationCondition` already provides Block Until Done / Cache; visual-only tools have no runtime equivalent). Tool Container's INNER tools still get imported. |
 
-### Alteryx formula functions translated **deterministically** (no LLM needed)
+## Formula translation — deterministic, no LLM needed
 
 | Category | Functions |
 |---|---|
-| Conditional | `IIF` · `Switch` |
-| String | `Contains` · `StartsWith` · `EndsWith` · `Length` · `Trim` · `TrimLeft` · `TrimRight` · `UpperCase` · `LowerCase` · `TitleCase` · `Substring` · `Left` · `Right` · `ToString` · `ToNumber` · `Replace` · `ReplaceFirst` · `Regex_Replace` · `Regex_Match` · `Regex_CountMatches` · `FindString` · `PadLeft` · `PadRight` |
+| Conditional | `IIF` · `Switch` · `IF…THEN…ELSEIF…ELSE…ENDIF` (rewritten to nested IIF) |
+| String | `Contains` · `StartsWith` · `EndsWith` · `Length` · `Trim` · `TrimLeft` · `TrimRight` · `UpperCase` · `LowerCase` · `TitleCase` · `Substring` · `Left` · `Right` · `ToString` · `ToNumber` · `Replace` · `ReplaceFirst` · `ReplaceChar` · `Regex_Replace` · `Regex_Match` · `Regex_CountMatches` · `FindString` · `PadLeft` · `PadRight` |
+| Math | `Abs` · `Sqrt` · `Log` · `Round` · `Min` · `Max` · `Mod` · `Avg` · `Sum` · `Median` · `Count` · `Coalesce` |
 | Null | `IsNull` · `IsEmpty` · `Null` |
-| Date/Time | `DateTimeAdd` · `DateTimeDiff` · `DateTimeFormat` · `DateTimeParse` · `DateTimeNow` · `DateTimeToday` · `DateTimeYear` · `DateTimeMonth` · `DateTimeDay` · `DateTimeHour` · `DateTimeMinute` · `DateTimeSecond` |
-| Operators | `AND` / `OR` / `NOT` → `&` / `|` / `~`; arithmetic + comparisons passthrough |
+| Date/Time | `DateTimeAdd` · `DateTimeDiff` · `DateTimeFormat` · `DateTimeParse` · `DateTimeNow` · `DateTimeToday` · `DateTimeYear` · `DateTimeMonth` · `DateTimeDay` · `DateTimeHour` · `DateTimeMinute` · `DateTimeSecond` · `ToDate` · `ToDateTime` |
+| Operators | `AND` / `OR` / `NOT` / `!` → `&` / `\|` / `~`; `=` (Alteryx-style equality) → `==`; comparisons inside boolean ops are auto-paren-wrapped to fix pandas precedence |
 | Field refs | `[Field]` → `Field` (pandas-eval) or `df["Field"]` (when the expression needs the PYTHON path) |
 
-Arg parsing is paren-balanced and quote-aware, so nested calls work: `IIF(Contains([s], "x"), 1, 0)` → `np.where(df["s"].str.contains("x", regex=False), 1, 0)`.
+Arg parsing is paren-balanced and quote-aware: `IIF(Contains([s], "x"), 1, 0)` → `np.where(df["s"].str.contains("x", regex=False), 1, 0)`.
 
-### `.yxzp` packages
+## `.yxzp` packages
 
-Parses the workflow inside the zip; inventories bundled `.yxdb` data files and `.yxmc` macros. With the `dataframe_from_yxdb` registry component, bundled `.yxdb` files are readable natively — no conversion required.
+Parses the workflow inside the zip; inventories bundled `.yxdb` data files and `.yxmc` macros. With the `dataframe_from_yxdb` registry component, bundled `.yxdb` files are readable natively.
 
-### Output formats
+## Output formats
 
-- One `defs.yaml` per Alteryx tool (or inline `@dg.asset` `.py` for tools that need pandas Series ops that pandas-eval can't compile, like `np.where`/`.str.contains`/`.dt.strftime`).
-- `MIGRATION.md` — every translation note + every unmapped tool with a suggestion.
-- `CLOUD_PORTABILITY.md` — automatically emitted when any defs.yaml contains a local absolute path (e.g. `/data/customers.csv`), warning that local paths break the moment the project deploys off a developer laptop and recommending S3 / GCS / ADLS / Snowflake-stage equivalents.
+- One `defs.yaml` per Alteryx tool, plus inline `@dg.asset` `.py` for the handful of cases that need pandas Series ops the pandas-eval engine can't compile (e.g. self-joins, rootless GenerateRows seeds).
+- `MIGRATION.md` — every translation note, every unmapped tool with a suggestion, plus a **real-compute mapping rate** (excludes control-flow tools that are intentionally skipped).
+- `CLOUD_PORTABILITY.md` — automatically emitted when any defs.yaml contains a local absolute path, warning that local paths break the moment the project deploys off a developer laptop and recommending S3 / GCS / ADLS / Snowflake-stage equivalents.
 
-### LLM-assisted fallback
+## LLM-assisted fallback
 
-For Alteryx-only functions the deterministic translator doesn't recognize (custom macros, vendor extensions), opt in with `--llm-translate <model>`:
+For Alteryx-only functions the deterministic translator doesn't recognize (vendor extensions, custom macros), opt in with `--llm-translate <model>`:
 
 ```bash
 alteryx-to-dagster import workflow.yxmd \
@@ -82,54 +86,19 @@ alteryx-to-dagster import workflow.yxmd \
     --llm-translate gpt-4o-mini --llm-api-key-env OPENAI_API_KEY
 ```
 
-Two LiteLLM calls per flagged expression — translate + independent score — at **import time only**. Translations meeting `--llm-score-threshold` (default 0.8) get baked into the emitted YAML / `.py`. Below the threshold the expression stays flagged in MIGRATION.md.
+Two LiteLLM calls per flagged expression — translate + independent score — **at import time only**. Translations meeting `--llm-score-threshold` (default 0.8) get baked into the emitted YAML / `.py`. Below the threshold the expression stays flagged in MIGRATION.md.
 
 **Runtime is 100% LLM-free regardless** — the resulting Dagster project just runs pandas / SQL.
 
 Cost: ~$0.0004 per flagged expression at gpt-4o-mini. One-time per import.
 
-## What it can't do today
+## Validation corpus
 
-| Category | Status |
-|---|---|
-| Reporting tools (Render / Layout / Email / Charting) | Skipped — different paradigm; reports don't have a clean Dagster equivalent |
-| Interface tools (Macro Input/Output / Control Parameter / Action) | Skipped — these only exist for Alteryx Apps/Macros UI |
-| Documentation tools (Comment / Tool Container / Browse / HTMLBox / Text Box) | Skipped as control-flow — purely visual. Tool Container's INNER tools still get imported (the container itself is a no-op wrapper). |
-| Auto Field (runtime dtype inference) | Skipped — Dagster components handle dtype inference at read time (`pd.read_csv`, `inline_dataframe`'s `dtypes` field). |
-| Data Investigation tools (Field Summary / Pearson Correlation / Frequency Table) | **Pearson Correlation** ✓ via `pearson_correlation` component. Field Summary maps via `summarize` + `dataframe_describe`. Frequency Table not yet wired. |
-| Basic spatial (Create Points / Geo Buffer / Geo Overlay / Geo Simplify / Drive Time / Poly Split) | **Done** — `points_from_latlon`, `geo_buffer`, `geo_overlay`, `geo_simplify`, `drive_time` (openrouteservice / google / mapbox / osrm), `poly_split`. |
-| Advanced spatial (Spatial Match / Distance / Trade Area / Find Nearest / Poly Build / Map Input / Spatial Info) | Partial — Find Nearest can route to `nearest_neighbors`. Spatial Match / Distance / Trade Area / Poly Build mappers not yet wired. |
-| Predictive — sklearn-backed (Linear/Logistic Regression / Decision Tree / Random Forest / Naive Bayes / Neural Network / SVM / Gradient Boosting / PCA / Score) | Registry components exist with `model_path` joblib save; Alteryx-plugin → mapper entries not yet wired. |
-| Predictive — statsmodels-backed (Count Regression / Gamma Regression) | Registry components exist with `.save()` / `sm.load()`; mapper entries not yet wired. |
-| Time Series (TS Forecast / TS Plot) | Registry has `arima_forecast`, `ets_forecast`; mapper entries not yet wired. |
-| Custom macros (`.yxmc`) | **Done** — `macro_splicer.py` recursively inlines macros (max depth 5), renumbers tool_ids with `m<parent>_` prefix, rewires Macro Input/Output anchors. Stock macros like `Cleanse.yxmc` route to dedicated registry components (`data_cleansing`) instead of inlining. |
-| In-DB tools (Connect/Input/Filter/Formula/Select/Summarize/Join/Union/Sample/StreamOut/WriteData) | Mapped 1:1 to `sql_transform` per-tool today. **Pending:** collapse In-DB subgraphs into a single `warehouse_pipeline` CTE chain (preserves Alteryx's pushdown semantics; In-DB Stream Out routes via `warehouse_pipeline.return_dataframe=True`). |
-| Multi-Row Formula (window-style) | Not yet — would need a `multi_row_formula` component (windowed `df.shift()` / rolling pattern). |
-| Dynamic Rename (pattern-based) | Not yet — maps roughly to `select_columns` with `rename`; needs the rename-pattern → column-pair expansion. |
-| Alteryx Apps (Interface tools / Action / Control Parameter) | Not supported — Interface tools have no Dagster equivalent. |
+Continuously tested against the [Alteryx Weekly Challenge](https://community.alteryx.com/categories/weeklychallenge-board) workflows — 83 .yxmd files covering most tool families. Current stats:
 
-For In-DB tools: each Alteryx In-DB tool becomes its own `sql_transform` asset that materializes an intermediate table. This is the simplest correct mapping but loses Alteryx's single-query pushdown. Future versions can detect connected In-DB subgraphs and collapse them into one `sql_transform` with CTEs.
-
-## End-to-end validated
-
-Sample at `samples/sample_with_iif.yxmd` — 5 tools (Text Input → Formula with IIF + Contains → Sample FirstN=5 → Record ID → CSV) imports → installs → materializes:
-
-```
-region,product,quantity,unit_price,revenue,bulk_tier,is_widget,row_num
-North,Widget,10,5.5,55.0,standard,True,1
-North,Gadget,3,12.0,36.0,standard,False,2
-South,Widget,7,5.5,38.5,standard,True,3
-South,Gadget,15,12.0,180.0,bulk,False,4
-East,Widget,20,5.5,110.0,bulk,True,5
-```
-
-IIF + Contains translated deterministically — no LLM call made.
-
-## Why an external tool, not a sub-command of `dagster-component`?
-
-Migration is a one-shot affair — you run it once per Alteryx workflow, get a Dagster project, then iterate from there. The community-components CLI is a daily-driver tool (search / info / add / schema). Different cadence, different scope.
-
-The importer **uses** the community registry — it shells out to `dagster-component add` to install the components it maps to. No tight coupling either way.
+- Real-compute mapping rate: **100%** (every non-control-flow tool maps to a component)
+- Static validation pass: **100%** (every emitted defs.yaml loads under `dg check`)
+- Materialization (with auto-stubbed inputs): **~69%** and rising; remaining failures are split between Alteryx-internal workflow quirks (a few tools reference output cols before they're created) and component-internal long-tail edge cases.
 
 ## License
 
