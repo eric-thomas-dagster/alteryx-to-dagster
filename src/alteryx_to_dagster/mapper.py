@@ -514,17 +514,50 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
             ],
         )
 
+    # Alteryx Joins embed a <SelectConfiguration><SelectFields/> block that
+    # renames/drops cols inline. Right-side cols arrive with a Right_ prefix
+    # in Alteryx's output; SelectField rename="X" then gives them final names.
+    # Forward this to dataframe_join via right_prefix + rename + drop_columns.
+    embedded_select = node.config.find("SelectConfiguration")
+    if embedded_select is None:
+        embedded_select = node.config.find(".//SelectFields")
+    post_rename: Dict[str, str] = {}
+    post_drop: List[str] = []
+    has_explicit_select_rules = False
+    if embedded_select is not None:
+        sf_el = embedded_select if embedded_select.tag == "SelectFields" else embedded_select.find(".//SelectFields")
+        if sf_el is not None:
+            for sf in sf_el.findall("SelectField"):
+                fname = sf.attrib.get("field", "")
+                if not fname or fname == "*Unknown":
+                    continue
+                selected = sf.attrib.get("selected", "True").lower() == "true"
+                rename = sf.attrib.get("rename", "")
+                has_explicit_select_rules = True
+                if not selected:
+                    post_drop.append(fname)
+                elif rename and rename != fname:
+                    post_rename[fname] = rename
+
+    attrs: Dict[str, Any] = {
+        "left_asset_key": left_key,
+        "right_asset_key": right_key,
+        "left_on": join_fields_l,
+        "right_on": join_fields_r,
+        "how": "inner",
+        "group_name": "alteryx_imported",
+    }
+    if has_explicit_select_rules:
+        attrs["right_prefix"] = "Right_"
+        if post_rename:
+            attrs["rename"] = post_rename
+        if post_drop:
+            attrs["drop_columns"] = post_drop
+
     return MappedTool(
         component_id="dataframe_join",
         asset_name=_asset_name_for(node),
-        attributes={
-            "left_asset_key": left_key,
-            "right_asset_key": right_key,
-            "left_on": join_fields_l,
-            "right_on": join_fields_r,
-            "how": "inner",
-            "group_name": "alteryx_imported",
-        },
+        attributes=attrs,
         notes=[
             f"Join on tool {node.tool_id}: Alteryx's Join also emits Left-Unjoined "
             "and Right-Unjoined anchors. The default mapping is inner-join only. "
