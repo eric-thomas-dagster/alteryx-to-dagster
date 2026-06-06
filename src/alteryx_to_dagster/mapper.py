@@ -1765,7 +1765,12 @@ def _map_tile(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """
     cfg = node.config
     method_el = cfg.find("Method")
+    # Alteryx nests the target field inside the method-specific sub-element
+    # (e.g. <SmartTile><Field>X</Field></SmartTile>) but the simpler
+    # EqualRecords form puts it at the top of the config. Try both.
     field_el = cfg.find("Field")
+    if field_el is None or not (field_el.text and field_el.text.strip()):
+        field_el = cfg.find(".//Field")
     num_el = cfg.find("NumTiles")
     out_field = cfg.find("OutputField")
     method_a = (method_el.text or "EqualRecords").strip() if method_el is not None and method_el.text else "EqualRecords"
