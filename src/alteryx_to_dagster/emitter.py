@@ -227,6 +227,36 @@ def emit_migration_report(
     for tool_id, plugin, comp_id, asset_name, _notes in mapped:
         lines.append(f"| {tool_id} | `{plugin}` | `{comp_id}` | `{asset_name}` |")
 
+    # Detect required env vars based on which components landed in `mapped`.
+    # The matching `dagster-component-templates` components default to these
+    # env var names, so the user just needs to `export` before running `dg dev`.
+    _COMPONENT_ENV_VARS: Dict[str, List[tuple[str, str]]] = {
+        "drive_time": [("OPENROUTESERVICE_API_KEY", "free key at https://openrouteservice.org/dev/#/signup (2000 req/day; or set provider=google/mapbox/osrm to use a different routing API)")],
+        "geocoder": [("NOMINATIM_USER_AGENT", "any descriptive string for the OSM Nominatim user-agent header; defaults to 'alteryx-to-dagster' if unset")],
+        "per_row_http_fetcher": [],
+        "warehouse_pipeline": [("<CONNECTION_NAME>_URL", "SQLAlchemy URL for the warehouse the Alteryx In-DB Connection referenced — env var name is slugified from the connection (e.g. 'Snowflake Prod' → SNOWFLAKE_PROD_URL)")],
+        "sql_transform": [("<CONNECTION_NAME>_URL", "same convention as warehouse_pipeline — SQLAlchemy URL for the In-DB connection")],
+    }
+    env_rows: List[tuple] = []
+    used_comp_ids = sorted({ci for (_, _, ci, _, _) in mapped})
+    for ci in used_comp_ids:
+        for env_name, note in _COMPONENT_ENV_VARS.get(ci, []):
+            env_rows.append((ci, env_name, note))
+    if env_rows:
+        lines += [
+            "",
+            "## Required environment variables",
+            "",
+            "Export these before running `dg dev` / materializing. Without "
+            "them, the listed assets will fail with a clear OSError pointing "
+            "you back here.",
+            "",
+            "| Component | Env var | What it's for |",
+            "|---|---|---|",
+        ]
+        for ci, env_name, note in env_rows:
+            lines.append(f"| `{ci}` | `{env_name}` | {note} |")
+
     note_rows = [(tid, plg, an, n) for (tid, plg, _ci, an, ns) in mapped for n in ns]
     if note_rows:
         lines += [
