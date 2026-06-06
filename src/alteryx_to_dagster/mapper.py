@@ -417,6 +417,7 @@ def _map_summarize(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
         from a chosen source. Use the named form whenever Alteryx supplies a rename.
     """
     group_by: List[str] = []
+    group_by_rename: Dict[str, str] = {}
     aggs: Dict[str, object] = {}
     sf_el = node.config.find("SummarizeFields")
     if sf_el is not None:
@@ -429,20 +430,27 @@ def _map_summarize(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
                 continue
             if action == "groupby":
                 group_by.append(field_name)
+                # Alteryx allows renaming the group-by output column inline.
+                # Forward via summarize's group_by_rename field.
+                if rename and rename != field_name:
+                    group_by_rename[field_name] = rename
             else:
                 if rename and rename != field_name:
                     aggs[rename] = {"col": field_name, "agg": action}
                 else:
                     aggs[field_name] = action
+    attrs: Dict[str, object] = {
+        "upstream_asset_key": _single_upstream(upstreams),
+        "group_by": group_by,
+        "aggregations": aggs,
+        "group_name": "alteryx_imported",
+    }
+    if group_by_rename:
+        attrs["group_by_rename"] = group_by_rename
     return MappedTool(
         component_id="summarize",
         asset_name=_asset_name_for(node),
-        attributes={
-            "upstream_asset_key": _single_upstream(upstreams),
-            "group_by": group_by,
-            "aggregations": aggs,
-            "group_name": "alteryx_imported",
-        },
+        attributes=attrs,
     )
 
 
@@ -1939,6 +1947,10 @@ def _map_running_total(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
         attributes={
             "upstream_asset_key": _single_upstream(upstreams),
             "value_column": primary,
+            # Alteryx names the running-total output column `RunTot_<field>`;
+            # downstream tools reference that exact name. Override the
+            # component's default (`running_<field>`) to match.
+            "output_column": f"RunTot_{primary}" if primary else None,
             "group_by": group_by or None,
             "group_name": "alteryx_imported",
         },
