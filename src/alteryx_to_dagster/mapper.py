@@ -420,6 +420,9 @@ def _map_summarize(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
             field_name = f.attrib.get("field", "")
             action = f.attrib.get("action", "").lower()
             rename = f.attrib.get("rename") or None
+            # `*Unknown` is Alteryx's wildcard — never a real column name.
+            if field_name == "*Unknown":
+                continue
             if action == "groupby":
                 group_by.append(field_name)
             else:
@@ -447,6 +450,9 @@ def _map_join(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
         for f in jf_el.findall("Field"):
             l = f.attrib.get("field")
             r = f.attrib.get("field2") or l
+            # Skip Alteryx's *Unknown wildcard if Alteryx put it in JoinInfo.
+            if l == "*Unknown" or r == "*Unknown":
+                continue
             if l:
                 join_fields_l.append(l)
             if r:
@@ -490,7 +496,7 @@ def _map_sort(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
         for f in sf_el.findall("Field"):
             fn = f.attrib.get("field")
             order = f.attrib.get("order", "Ascending")
-            if fn:
+            if fn and fn != "*Unknown":
                 by.append(fn)
                 ascending.append(order.lower().startswith("asc"))
     # The `sort` component takes EITHER `ascending: bool` (single direction
@@ -519,7 +525,7 @@ def _map_unique(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     if uf_el is not None:
         for f in uf_el.findall("Field"):
             fn = f.attrib.get("field")
-            if fn:
+            if fn and fn != "*Unknown":
                 fields.append(fn)
     return MappedTool(
         component_id="unique_dedup",
@@ -1827,7 +1833,7 @@ def _map_cross_tab(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     cfg = node.config
     for f in cfg.findall("GroupFields/Field"):
         fn = f.attrib.get("field")
-        if fn:
+        if fn and fn != "*Unknown":
             group_by.append(fn)
     hf = cfg.find("HeaderField")
     if hf is not None:
@@ -1888,9 +1894,11 @@ def _map_transpose(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     if data_has_wildcard:
         # Signal to unpivot: "use all non-id columns" by passing None.
         data_fields = []
-    # pd.melt rejects var_name / value_name that match an existing column.
-    # Pick defaults unlikely to collide — "Name" and "Value" are super-common
-    # column names; "Variable" + "MeltedValue" are safer.
+    # Match Alteryx's default output column names — "Name" + "Value" —
+    # because downstream tools in the source workflow reference those
+    # exact names. If the upstream happens to also have a "Value" or
+    # "Name" column, pd.melt raises and the user manually renames in
+    # the emitted defs.yaml (or upstream Select drops the conflict).
     return MappedTool(
         component_id="unpivot",
         asset_name=_asset_name_for(node),
@@ -1898,16 +1906,10 @@ def _map_transpose(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
             "upstream_asset_key": _single_upstream(upstreams),
             "id_columns": key_fields,
             "value_columns": data_fields or None,
-            "var_name": "Variable",
-            "value_name": "MeltedValue",
+            "var_name": "Name",
+            "value_name": "Value",
             "group_name": "alteryx_imported",
         },
-        notes=[
-            f"Transpose on tool {node.tool_id}: emitted with var_name='Variable' "
-            "and value_name='MeltedValue' to avoid collisions with common "
-            "column names. Alteryx's defaults are 'Name' / 'Value' — rename "
-            "if downstream tools expect those exact column names."
-        ],
     )
 
 
