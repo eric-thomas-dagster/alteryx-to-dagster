@@ -70,13 +70,20 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "pearson_correlation": "PearsonCorrelationComponent",
     "per_row_http_fetcher": "PerRowHttpFetcherComponent",
     "data_cleansing": "DataCleansingComponent",
-    "points_from_latlon": "PointsFromLatLonComponent",
-    "drive_time": "DriveTimeComponent",
-    "geo_buffer": "GeoBufferComponent",
-    "geo_overlay": "GeoOverlayComponent",
-    "geo_simplify": "GeoSimplifyComponent",
-    "pearson_correlation": "PearsonCorrelationComponent",
-    "per_row_http_fetcher": "PerRowHttpFetcherComponent",
+    # Predictive — sklearn-backed registry components (with model_path joblib save)
+    "linear_regression_model": "LinearRegressionModelComponent",
+    "logistic_regression_model": "LogisticRegressionModelComponent",
+    "decision_tree_model": "DecisionTreeModelComponent",
+    "random_forest_model": "RandomForestModelComponent",
+    "naive_bayes_model": "NaiveBayesModelComponent",
+    "neural_network_model": "NeuralNetworkModelComponent",
+    "svm": "SVMComponent",
+    "gradient_boosting_model": "GradientBoostingModelComponent",
+    "pca": "PcaComponent",
+    "model_score": "ModelScoreComponent",
+    # Predictive — statsmodels-backed (with res.save() / sm.load() support)
+    "count_regression": "CountRegressionComponent",
+    "gamma_regression": "GammaRegressionComponent",
 }
 
 
@@ -154,13 +161,48 @@ def emit_migration_report(
     mapped: List[tuple],   # list of (tool_id, plugin_short, component_id, asset_name, notes)
     unmapped: List[tuple], # list of (tool_id, plugin, reason, suggestion)
 ) -> Path:
-    """Write MIGRATION.md summarizing what was converted and what wasn't."""
+    """Write MIGRATION.md summarizing what was converted and what wasn't.
+
+    Separates "control-flow" unmapped entries (Browse / TextBox / Tool
+    Container — intentionally not mapped, NOT failures) from "real" unmapped
+    (tools that NEED a mapper). The real-compute mapping rate is what users
+    should evaluate the importer on.
+    """
+    # Bucket the unmapped list. Heuristic: control-flow entries' `reason`
+    # contains phrases like "Drop" / "purely visual" / "Dagster's DAG already"
+    # / "no compute" — i.e. an explanation rather than a defect.
+    _CTRL_PHRASES = (
+        "annotation only", "purely visual", "no compute", "no data flow",
+        "drop after", "drop; if", "drop the comment", "data preview",
+        "implicit in", "alteryx-specific data preview", "documentation only",
+        "block until done", "cache dataset",
+    )
+    control_flow: List[tuple] = []
+    real_unmapped: List[tuple] = []
+    for entry in unmapped:
+        reason = entry[2] if len(entry) > 2 else ""
+        is_control = any(p in reason.lower() for p in _CTRL_PHRASES)
+        if is_control:
+            control_flow.append(entry)
+        else:
+            real_unmapped.append(entry)
+
+    real_total = len(mapped) + len(real_unmapped)
+    real_rate = (len(mapped) / real_total * 100) if real_total else 100.0
+
     out_root.mkdir(parents=True, exist_ok=True)
     md = out_root / "MIGRATION.md"
     lines = [
         f"# Alteryx → Dagster migration report",
         "",
         f"Source workflow: `{yxmd_source}`",
+        "",
+        f"## Coverage",
+        "",
+        f"- **Real-compute mapping rate: {real_rate:.1f}%** ({len(mapped)} / {real_total} real-compute tools)",
+        f"- Mapped to Dagster components / inline-python:  **{len(mapped)}**",
+        f"- Unmapped (need a mapper):                       **{len(real_unmapped)}**",
+        f"- Control-flow (intentionally skipped):           **{len(control_flow)}**  (Browse / TextBox / Tool Container / etc. — purely visual)",
         "",
         f"- Tools mapped: **{len(mapped)}**",
         f"- Tools unmapped: **{len(unmapped)}**",
