@@ -3662,13 +3662,22 @@ _CONTROL_FLOW_PLUGINS = {
     ),
     "AlteryxGuiToolkit.Detour.Detour": (
         "Detour — conditional bypass. Dagster equivalent: AutomationCondition "
-        "on the downstream asset, or a `dagster.skip_if` pattern in a sensor. "
-        "Not auto-mapped because the condition expression usually needs "
-        "human judgment for the Dagster-native shape."
+        "on the downstream asset. No data flow; drop after wiring."
     ),
     "AlteryxGuiToolkit.Detour.DetourEnd": (
-        "Detour End — companion to the Detour tool. Drop after wiring up "
-        "the Detour's downstream AutomationCondition."
+        "Detour End — companion to the Detour tool. No data flow; drop."
+    ),
+    # Alteryx ships Detour under both GuiToolkit (older) and BasePluginsGui
+    # (newer) namespaces. Register both so neither leaks as truly unmapped.
+    "AlteryxBasePluginsGui.Detour.Detour": (
+        "Detour — conditional bypass. Dagster equivalent: AutomationCondition. "
+        "No data flow; drop."
+    ),
+    "AlteryxBasePluginsGui.DetourEnd.DetourEnd": (
+        "Detour End — companion to Detour. No data flow; drop."
+    ),
+    "AlteryxBasePluginsGui.Detour.DetourEnd": (
+        "Detour End — companion to Detour. No data flow; drop."
     ),
     "AlteryxGuiToolkit.Action.Action": (
         "Action — Alteryx App machinery that mutates the workflow when a "
@@ -3903,6 +3912,61 @@ _CONTROL_FLOW_PLUGINS = {
         "splicer wires this into the parent workflow; standalone MacroInput "
         "nodes only appear when the macro itself was the imported file. "
         "Treat as a no-op input."
+    ),
+    # Additional App-interface Question types (radio buttons, dropdowns,
+    # question-text-box, file-browse). All are App UI controls — no data flow.
+    "AlteryxGuiToolkit.Questions.RadioButtonGroup.RadioButtonGroup": (
+        "Radio Button Group — App interface control. No data flow; "
+        "becomes a Dagster config field with choices. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.DropDownListBox.DropDown": (
+        "DropDown — App interface control. No data flow; becomes a "
+        "Dagster config field with an enum. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.DropDownListBox.DropDownListBox": (
+        "DropDown List Box — App interface control. No data flow; becomes a "
+        "Dagster config field with an enum. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.DropDownListBox.ListBox": (
+        "List Box (DropDown family) — App interface control. No data flow; "
+        "becomes a Dagster config list field. Drop."
+    ),
+    "ReportHeader": (
+        "Report Header (bare-name alias) — annotation only. No data flow. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.TextBox.QuestionTextBox": (
+        "Question Text Box — App interface free-text input. No data flow; "
+        "becomes a Dagster config string field. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.FileBrowse.FileBrowse": (
+        "File Browse — App interface file picker. No data flow; replace "
+        "with a Dagster config field that takes a path string. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.FolderBrowse.FolderBrowse": (
+        "Folder Browse — App interface folder picker. No data flow; "
+        "becomes a Dagster config field with a path string. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.Date.Date": (
+        "Date — App interface date picker. No data flow; becomes a Dagster "
+        "partition key or config date field. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.ListBox.ListBox": (
+        "List Box — App interface multi-select. No data flow; becomes a "
+        "Dagster config list field. Drop."
+    ),
+    "AlteryxGuiToolkit.Questions.MapInput.MapInput": (
+        "Map Input (Question) — App interface map-region selector. "
+        "No data flow; replace with a Dagster config field. Drop."
+    ),
+    "AlteryxBasePluginsGui.ReportHeader.ReportHeader": (
+        "Report Header — annotation only inside an HTML report. No data flow. Drop."
+    ),
+    # The Render terminal tool occasionally appears bare (rare). Treat as
+    # a report sink — but if we got here it means we couldn't route to
+    # pdf_report (e.g. no upstream); skip with note.
+    "AlteryxGuiToolkit.Render.Render": (
+        "Render — HTML report renderer. No runtime DataFrame output; "
+        "route to pdf_report manually for PDF output."
     ),
 }
 

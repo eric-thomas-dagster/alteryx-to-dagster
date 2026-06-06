@@ -196,6 +196,21 @@ def emit_migration_report(
         "drop after", "drop; if", "drop the comment", "data preview",
         "implicit in", "alteryx-specific data preview", "documentation only",
         "block until done", "cache dataset",
+        # App interface tools (Questions / Action / Tab / Label / ControlParam)
+        "app interface", "app machinery", "app input", "app numeric input",
+        "alteryx app", "alteryx-specific", "interface tool", "interface control",
+        # Macro boundary markers (MacroInput / MacroOutput land in this bucket
+        # when the macro splicer couldn't inline them — that's not a real "needs
+        # mapper" failure)
+        "macro splicer wires", "boundary marker", "no standalone dagster asset",
+        # Visual report tools that don't have a runtime semantic
+        "html report", "visual concern", "page-layout grouping", "stacks report",
+        "report renderer", "html report builder", "visual grouping",
+        # Dtype inference Auto Field is the canonical "we don't need an emit"
+        "no emit needed", "runtime type inference",
+        # Macros referenced by relative path outside the bundle — not really
+        # unmapped, we just can't find the .yxmc on disk
+        "couldn't be inlined", "file not found alongside",
     )
     control_flow: List[tuple] = []
     real_unmapped: List[tuple] = []
