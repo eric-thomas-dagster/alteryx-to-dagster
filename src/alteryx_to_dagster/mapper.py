@@ -457,6 +457,42 @@ def _map_summarize(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 def _map_join(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     join_fields_l: List[str] = []
     join_fields_r: List[str] = []
+    # Positional join (joinByRecordPos="True"): Alteryx stitches rows by
+    # position with no key. Emit an inline @dg.asset that does
+    # pd.concat([left, right], axis=1) — the closest pandas equivalent.
+    cfg_attrib = node.config.attrib.get("joinByRecordPos", "").lower()
+    if cfg_attrib == "true" and len(upstreams) >= 2:
+        asset_name = _asset_name_for(node)
+        left_key, right_key = upstreams[0], upstreams[1]
+        py = f'''"""Alteryx positional Join (tool {node.tool_id}) — pd.concat by row position."""
+import dagster as dg
+import pandas as pd
+
+
+@dg.asset(
+    name={asset_name!r},
+    group_name="alteryx_imported",
+    ins={{
+        "left": dg.AssetIn(key=dg.AssetKey({left_key!r})),
+        "right": dg.AssetIn(key=dg.AssetKey({right_key!r})),
+    }},
+    description="Alteryx positional Join (tool {node.tool_id}) — joined by record position.",
+)
+def {asset_name}(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+    left = left.reset_index(drop=True)
+    right = right.reset_index(drop=True).add_prefix("Right_")
+    return pd.concat([left, right], axis=1)
+'''
+        return MappedTool(
+            component_id="(inline_python)",
+            asset_name=asset_name,
+            inline_python=py,
+            notes=[
+                f"Join on tool {node.tool_id}: joinByRecordPos='True' — positional join. "
+                "Emitted as inline pandas pd.concat(..., axis=1) with right cols Right_-prefixed."
+            ],
+        )
+
     # Alteryx joins encode keys as TWO sibling <JoinInfo> blocks —
     # connection="Left" and connection="Right" — each with one or more
     # <Field field="X"/> children. Read both side-by-side so cross-name
@@ -3001,86 +3037,69 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
         )
     ),
     "AlteryxBasePluginsGui.RTool.RTool": (
-        # R Tool runs R code against the upstream DataFrame (Alteryx historically
-        # transferred via .yxdb). Emit a passthrough inline @dg.asset with the
-        # R script preserved as a comment block — user picks: rewrite in Python,
-        # or wrap with subprocess.run(["Rscript", ...]) calling rpy2.
-        lambda node, upstreams: (lambda code_el, upstream_name=(_single_upstream(upstreams) or "upstream"): MappedTool(
-            component_id="(inline_python)",
+        # R Tool → r_script component. Runs the original R script natively
+        # via Rscript subprocess (or rpy2 if installed). User picks backend
+        # in the emitted defs.yaml.
+        lambda node, upstreams: (lambda code_el: MappedTool(
+            component_id="r_script",
             asset_name=_asset_name_for(node),
-            inline_python=(
-                f'"""Alteryx R Tool (tool {node.tool_id}) — port to Python or shell out to Rscript."""\n'
-                f'import dagster as dg\n'
-                f'import pandas as pd\n\n\n'
-                f'@dg.asset(\n'
-                f'    name={_asset_name_for(node)!r},\n'
-                f'    group_name="alteryx_imported",\n'
-                f'    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream_name!r}))}},\n'
-                f'    description="Alteryx R Tool (tool {node.tool_id}) — passthrough stub",\n'
-                f')\n'
-                f'def {_asset_name_for(node)}(upstream: pd.DataFrame) -> pd.DataFrame:\n'
-                f'    df = upstream\n'
-                f'    # Original R script body — port to Python (pandas / numpy / scikit-learn)\n'
-                f'    # or shell out via:\n'
-                f'    #   import subprocess; subprocess.run(["Rscript", "script.R", ...])\n'
-                f'    # or use rpy2 for in-process R from Python.\n'
-                f'    # R script was:\n'
-                f'    # ' + ("\n    # ".join((code_el.text or "").splitlines()[:30]) if code_el is not None and code_el.text else "(no embedded R script captured)") + "\n"
-                f'    return df\n'
-            ),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "script": (
+                    (code_el.text or "out_df <- df  # original R script not captured").strip()
+                    if code_el is not None and code_el.text else "out_df <- df"
+                ),
+                "backend": "rscript",
+                "intermediate_format": "parquet",
+                "group_name": "alteryx_imported",
+            },
             notes=[
-                f"R Tool on tool {node.tool_id}: R script preserved as comment "
-                "in inline @dg.asset. Port to Python or wrap with rpy2 / Rscript."
+                f"R Tool on tool {node.tool_id}: original R script ported to "
+                "r_script component (backend='rscript'). Confirm Rscript is on PATH "
+                "(or set backend='rpy2' if you have rpy2 installed). The script "
+                "must assign its result to `out_df`."
             ],
         ))(node.config.find("RCode") or node.config.find("Code") or node.config.find("Script"))
     ),
     "AlteryxRPluginsGui.RTool.RTool": (
         # Alternate plugin path (newer Alteryx releases route through RPluginsGui).
-        lambda node, upstreams: (lambda code_el, upstream_name=(_single_upstream(upstreams) or "upstream"): MappedTool(
-            component_id="(inline_python)",
+        lambda node, upstreams: (lambda code_el: MappedTool(
+            component_id="r_script",
             asset_name=_asset_name_for(node),
-            inline_python=(
-                f'"""Alteryx R Tool (tool {node.tool_id})."""\n'
-                f'import dagster as dg\n'
-                f'import pandas as pd\n\n\n'
-                f'@dg.asset(\n'
-                f'    name={_asset_name_for(node)!r},\n'
-                f'    group_name="alteryx_imported",\n'
-                f'    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream_name!r}))}},\n'
-                f'    description="Alteryx R Tool (tool {node.tool_id}) — passthrough stub",\n'
-                f')\n'
-                f'def {_asset_name_for(node)}(upstream: pd.DataFrame) -> pd.DataFrame:\n'
-                f'    df = upstream\n'
-                f'    # R script body (port to Python or shell out via Rscript / rpy2):\n'
-                f'    # ' + ("\n    # ".join((code_el.text or "").splitlines()[:30]) if code_el is not None and code_el.text else "(no embedded R script captured)") + "\n"
-                f'    return df\n'
-            ),
-            notes=[f"R Tool on tool {node.tool_id}: passthrough stub w/ R script preserved as comment."],
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "script": (
+                    (code_el.text or "out_df <- df").strip()
+                    if code_el is not None and code_el.text else "out_df <- df"
+                ),
+                "backend": "rscript",
+                "intermediate_format": "parquet",
+                "group_name": "alteryx_imported",
+            },
+            notes=[f"R Tool on tool {node.tool_id}: ported to r_script (backend='rscript')."],
         ))(node.config.find("RCode") or node.config.find("Code") or node.config.find("Script"))
     ),
     "JupyterCode": (
-        # Bare-name alias used by newer Alteryx versions.
-        lambda node, upstreams: (lambda code_el, upstream_name=(_single_upstream(upstreams) or "upstream"): MappedTool(
-            component_id="(inline_python)",
+        # JupyterCode → jupyter_notebook component (backend='exec' for inline body).
+        lambda node, upstreams: (lambda code_el: MappedTool(
+            component_id="jupyter_notebook",
             asset_name=_asset_name_for(node),
-            inline_python=(
-                f'"""Alteryx JupyterCode (tool {node.tool_id}) — embedded Python."""\n'
-                f'import dagster as dg\n'
-                f'import pandas as pd\n'
-                f'import numpy as np\n\n\n'
-                f'@dg.asset(\n'
-                f'    name={_asset_name_for(node)!r},\n'
-                f'    group_name="alteryx_imported",\n'
-                f'    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream_name!r}))}},\n'
-                f'    description="Alteryx JupyterCode (tool {node.tool_id})",\n'
-                f')\n'
-                f'def {_asset_name_for(node)}(upstream: pd.DataFrame) -> pd.DataFrame:\n'
-                f'    df = upstream\n'
-                f'    # Original Alteryx JupyterCode body:\n'
-                f'    # ' + ("\n    # ".join((code_el.text or "").splitlines()[:30]) if code_el is not None and code_el.text else "(no embedded code)") + "\n"
-                f'    return df\n'
-            ),
-            notes=[f"JupyterCode on tool {node.tool_id}: passthrough stub; port Python by hand or wrap with dagstermill."],
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "backend": "exec",
+                "code": (
+                    (code_el.text or "out_df = df").strip()
+                    if code_el is not None and code_el.text
+                    else "out_df = df  # original JupyterCode body not captured"
+                ),
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"JupyterCode on tool {node.tool_id}: original Python body ported "
+                "to jupyter_notebook component (backend='exec'). The code must "
+                "assign result to `out_df`. For real notebook execution, switch "
+                "backend='papermill' and supply notebook_path."
+            ],
         ))(node.config.find("Code") or node.config.find("Script") or node.config.find("NotebookSource"))
     ),
     "AlteryxSpatialPluginsGui.SpatialProcess.SpatialProcess": (
@@ -3171,36 +3190,24 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
         )
     ),
     "AlteryxBasePluginsGui.JupyterCode.JupyterCode": (
-        # JupyterCode runs Python (formerly via Alteryx Notebooks). Emit as
-        # an inline @dg.asset that exec()s the embedded code in a scope
-        # where the upstream DataFrame is `df`.
-        lambda node, upstreams: (lambda code_el, upstream_name=(_single_upstream(upstreams) or "upstream"): MappedTool(
-            component_id="(inline_python)",
+        # Fully-qualified alias — same target as the bare 'JupyterCode' key above.
+        lambda node, upstreams: (lambda code_el: MappedTool(
+            component_id="jupyter_notebook",
             asset_name=_asset_name_for(node),
-            inline_python=(
-                f'"""Alteryx JupyterCode (tool {node.tool_id}) — embedded Python run "\n'
-                f'against the upstream DataFrame as `df`."""\n'
-                f'import dagster as dg\n'
-                f'import pandas as pd\n'
-                f'import numpy as np\n\n\n'
-                f'@dg.asset(\n'
-                f'    name={_asset_name_for(node)!r},\n'
-                f'    group_name="alteryx_imported",\n'
-                f'    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({upstream_name!r}))}},\n'
-                f'    description="Alteryx JupyterCode (tool {node.tool_id})",\n'
-                f')\n'
-                f'def {_asset_name_for(node)}(upstream: pd.DataFrame) -> pd.DataFrame:\n'
-                f'    df = upstream\n'
-                f'    # Original Alteryx JupyterCode body (see MIGRATION.md notes):\n'
-                f'    # ' + ("\n    # ".join((code_el.text or "").splitlines()[:30]) if code_el is not None and code_el.text else "(no embedded code captured)") + "\n"
-                f'    # Replace this passthrough with the translated logic.\n'
-                f'    return df\n'
-            ),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "backend": "exec",
+                "code": (
+                    (code_el.text or "out_df = df").strip()
+                    if code_el is not None and code_el.text
+                    else "out_df = df  # original JupyterCode body not captured"
+                ),
+                "group_name": "alteryx_imported",
+            },
             notes=[
-                f"JupyterCode on tool {node.tool_id}: embedded Python passed "
-                "through as an inline @dg.asset stub. The Alteryx notebook's "
-                "code body is preserved as a comment block — port the logic "
-                "by hand, or wrap with dagstermill for native Jupyter execution."
+                f"JupyterCode on tool {node.tool_id}: ported to jupyter_notebook "
+                "(backend='exec'). Must assign `out_df`. For real notebook "
+                "execution, switch to backend='papermill' + notebook_path."
             ],
         ))(node.config.find("Code") or node.config.find("Script") or node.config.find("NotebookSource"))
     ),

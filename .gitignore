@@ -5,3 +5,9 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+
+# Sweep-harness stray writes — dbfileoutput tools with literal Windows
+# backslash paths (e.g. `..\..\_externals\style.yxdb`) land relative to
+# CWD on macOS/Linux instead of being sanitized.
+*.yxdb
+..\\*

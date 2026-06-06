@@ -88,6 +88,8 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "spatial_join": "SpatialJoinComponent",
     "spatial_process": "SpatialProcessComponent",
     "address_standardize": "AddressStandardizeComponent",
+    "r_script": "RScriptComponent",
+    "jupyter_notebook": "JupyterNotebookComponent",
     # Predictive — sklearn-backed registry components (with model_path joblib save)
     "linear_regression_model": "LinearRegressionModelComponent",
     "logistic_regression_model": "LogisticRegressionModelComponent",
