@@ -2322,7 +2322,27 @@ import pandas as pd
 )
 def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
     df = upstream.copy()
+    def _to_geom(v):
+        if v is None:
+            return None
+        # Already a shapely geometry?
+        if hasattr(v, "geom_type"):
+            return v
+        # WKT / GeoJSON string fall-through
+        s = str(v).strip()
+        if not s or s.lower() == "nan":
+            return None
+        try:
+            if s.startswith("{{"):
+                import json
+                from shapely.geometry import shape
+                return shape(json.loads(s))
+            from shapely import wkt as _wkt
+            return _wkt.loads(s)
+        except Exception:
+            return None
     def _explode(geom):
+        geom = _to_geom(geom)
         if geom is None or getattr(geom, "is_empty", False):
             return []
         try:
