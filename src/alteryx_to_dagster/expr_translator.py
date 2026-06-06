@@ -83,9 +83,26 @@ def translate(alteryx_expr: str) -> ExprTranslation:
     expr = alteryx_expr.strip()
     notes: List[str] = []
 
+    # Pre-pass: Alteryx allows `=` as an equality operator (in addition to
+    # `==`). pandas eval and Python both need `==`, so promote any bare `=`
+    # that isn't part of `==`, `<=`, `>=`, `!=` to `==`.
+    expr = _convert_alteryx_equality(expr)
+
     # First pass: if no function calls at all, this is bracket-stripping +
-    # operator passthrough. Doesn't need PYTHON path.
+    # operator passthrough. Doesn't need PYTHON path UNLESS a bracketed
+    # field name has spaces / punctuation — those need df["..."] wrapping
+    # because pandas-eval rejects identifiers with non-identifier chars.
     if not _has_function_call(expr):
+        if _has_non_identifier_brackets(expr):
+            return ExprTranslation(
+                pandas_expr=_wrap_brackets_for_python(expr),
+                is_python=True,
+                fully=True,
+                notes=[
+                    "Bracketed field name(s) contain spaces or punctuation — "
+                    "translated to PYTHON path (df[\"…\"]) instead of pandas eval."
+                ],
+            )
         return ExprTranslation(
             pandas_expr=_strip_brackets_for_eval(expr),
             is_python=False,
@@ -110,6 +127,59 @@ def translate(alteryx_expr: str) -> ExprTranslation:
 
 _FUNCTION_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _BRACKET_FIELD_RE = re.compile(r"\[([^\[\]]+)\]")
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _has_non_identifier_brackets(expr: str) -> bool:
+    """True iff any `[Field]` in `expr` has a name that isn't a valid
+    Python / pandas-eval identifier (spaces, hyphens, punctuation, leading
+    digits, etc.). Those need df["…"] wrapping; bare names eval fine."""
+    for m in _BRACKET_FIELD_RE.finditer(_strip_string_literals(expr)):
+        if not _IDENTIFIER_RE.match(m.group(1)):
+            return True
+    return False
+
+
+def _convert_alteryx_equality(expr: str) -> str:
+    """Alteryx allows `=` as the equality operator; pandas / Python need `==`.
+
+    Walk char-by-char, leaving `==`, `<=`, `>=`, `!=` alone and converting
+    any other bare `=` to `==`. Skips string literals.
+    """
+    out: List[str] = []
+    i, n = 0, len(expr)
+    in_str: Optional[str] = None
+    while i < n:
+        ch = expr[i]
+        if in_str is not None:
+            out.append(ch)
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "=":
+            # Skip `==` (already correct).
+            if i + 1 < n and expr[i + 1] == "=":
+                out.append("==")
+                i += 2
+                continue
+            # Skip if previous char is <, >, !, = (compound operator).
+            prev = expr[i - 1] if i > 0 else ""
+            if prev in ("<", ">", "!", "="):
+                out.append("=")
+                i += 1
+                continue
+            out.append("==")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 _OPERATOR_REPLACEMENTS = [
     # Alteryx logical operators → pandas / Python equivalents.
     # Be careful: replace as whole-word, not as substrings.

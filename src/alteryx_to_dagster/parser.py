@@ -71,6 +71,10 @@ class AlteryxWorkflow:
     # the importer can flag them in MIGRATION.md.
     bundled_data_files: List[str] = field(default_factory=list)
     bundled_macros: List[str] = field(default_factory=list)
+    # The directory the source file lives in. macro_splicer.splice_macros()
+    # uses this to resolve relative .yxmc references — Alteryx workflows
+    # typically reference user macros sitting next to the .yxmd.
+    source_dir: Optional[Path] = None
 
     def by_id(self) -> Dict[str, AlteryxNode]:
         return {n.tool_id: n for n in self.nodes}
@@ -120,6 +124,7 @@ def parse_workflow(path: str | Path) -> AlteryxWorkflow:
     wf = _from_root(root)
     wf.bundled_data_files = bundled_data_files
     wf.bundled_macros = bundled_macros
+    wf.source_dir = p.parent if p.exists() else None
     return wf
 
 
@@ -132,6 +137,19 @@ def _from_root(root: ET.Element) -> AlteryxWorkflow:
             tool_id = node_el.attrib.get("ToolID", "")
             gui = node_el.find("GuiSettings")
             plugin = (gui.attrib.get("Plugin", "") if gui is not None else "")
+
+            # Detect macro references — Alteryx stores them on
+            # <EngineSettings Macro="path/to/something.yxmc"/>. The Plugin
+            # attribute is typically empty for these, since the macro itself
+            # provides the implementation. Synthesize a sentinel plugin
+            # string so the mapper can route to either macro-splicing or
+            # stock-macro components.
+            if not plugin:
+                eng = node_el.find("EngineSettings")
+                if eng is not None:
+                    macro_ref = eng.attrib.get("Macro") or ""
+                    if macro_ref:
+                        plugin = f"AlteryxMacro::{macro_ref}"
 
             pos_el = gui.find("Position") if gui is not None else None
             position = {

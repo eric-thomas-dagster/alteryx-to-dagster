@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from .emitter import emit_inline_python, emit_migration_report, emit_yaml
-from .mapper import MappedTool, UnmappedTool, map_tool
+from .macro_splicer import splice_macros
+from .mapper import MappedTool, UnmappedTool, _stock_macro_basenames, map_tool
 from .parser import AlteryxNode, AlteryxWorkflow, parse_workflow
 
 
@@ -91,6 +92,18 @@ def import_workflow(
         )
 
     wf = parse_workflow(yxmd_path)
+
+    # Inline any nested macros (recursive — child macros expand too). The
+    # splicer skips macros routed to stock registry components (cleanse,
+    # etc.); those land in the parent's node list and the mapper handles
+    # the routing.
+    source_dir = wf.source_dir or yxmd_path.parent
+    wf = splice_macros(
+        wf,
+        source_dir=source_dir,
+        stock_macro_basenames=_stock_macro_basenames(),
+    )
+
     ordered = _topo_sort(wf)
 
     tool_to_asset: Dict[str, str] = {}
