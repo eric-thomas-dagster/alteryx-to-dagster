@@ -2290,28 +2290,58 @@ def _map_score(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 
 
 def _map_select(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx Select tool — keep/rename/reorder columns."""
+    """Alteryx Select tool — keep/rename/reorder columns.
+
+    Honors Alteryx's `*Unknown` semantic: when present + selected, it means
+    "ALSO keep all other (unlisted) upstream columns". In that case we emit
+    `columns: None` (the select_columns component interprets None as
+    keep-all-upstream-columns), apply renames, and surface explicit drops
+    separately if the user deselected specific fields.
+    """
     keep: List[str] = []
     rename_map: Dict[str, str] = {}
+    drop: List[str] = []
+    unknown_selected = False  # True means "keep all OTHER upstream cols too"
+
     sf_el = _find_first(node.config, "SelectFields", "Fields")
     if sf_el is not None:
         for f in sf_el.findall("SelectField") + sf_el.findall("Field"):
             fn = f.attrib.get("field")
             selected = f.attrib.get("selected", "True").lower() != "false"
             rename = f.attrib.get("rename")
-            if fn and selected and fn != "*Unknown":
+            if not fn:
+                continue
+            if fn == "*Unknown":
+                if selected:
+                    unknown_selected = True
+                continue
+            if selected:
                 keep.append(rename or fn)
                 if rename and rename != fn:
                     rename_map[fn] = rename
+            else:
+                drop.append(fn)
+
+    attrs: Dict[str, object] = {
+        "upstream_asset_key": _single_upstream(upstreams),
+        "group_name": "alteryx_imported",
+    }
+    if unknown_selected:
+        # `*Unknown` checked: keep ALL upstream columns + apply renames + drops.
+        # `columns: None` tells select_columns to keep everything; `drop_columns:`
+        # is the registry component's field name for explicit drops.
+        attrs["rename"] = rename_map or None
+        if drop:
+            attrs["drop_columns"] = drop
+        # Don't set `columns:` — None default keeps all.
+    else:
+        # No wildcard: only keep the explicitly-selected fields.
+        attrs["columns"] = keep
+        attrs["rename"] = rename_map or None
     return MappedTool(
         component_id="select_columns",
         asset_name=_asset_name_for(node),
-        attributes={
-            "upstream_asset_key": _single_upstream(upstreams),
-            "columns": keep,
-            "rename": rename_map or None,
-            "group_name": "alteryx_imported",
-        },
+        attributes=attrs,
     )
 
 
