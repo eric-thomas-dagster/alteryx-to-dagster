@@ -112,9 +112,13 @@ def _infer_dtype_from_values(values: List[str]) -> Optional[str]:
     # ISO datetime?
     if all(_ISO_DATETIME_RE.match(v) for v in non_empty):
         return "datetime64[ns]"
-    # All ints?
+    # All ints? Leading-zero values (e.g. '01234') are typed as strings —
+    # they're almost always ZIP codes / SSN / IDs where preserving the
+    # leading zero matters, and downstream .str ops on them break under Int64.
     try:
         [int(v) for v in non_empty]
+        if any(v.startswith("0") and v != "0" and not v.startswith("0.") for v in non_empty):
+            return None
         return "Int64"
     except (ValueError, TypeError):
         pass
@@ -2721,6 +2725,10 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
                 ],
                 "n_neighbors": int((node.config.find("HowMany").attrib.get("value", "5")) if node.config.find("HowMany") is not None else 5),
                 "metric": "euclidean",
+                # Alteryx FindNearest emits the distance column as `DistanceMiles`
+                # (and the matched-target join cols). Use that naming so downstream
+                # Alteryx Formula/Filter expressions referencing DistanceMiles resolve.
+                "distance_column_template": "DistanceMiles" if int((node.config.find("HowMany").attrib.get("value", "5")) if node.config.find("HowMany") is not None else 5) == 1 else "DistanceMiles_{i}",
                 "group_name": "alteryx_imported",
             },
             notes=[

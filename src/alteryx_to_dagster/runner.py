@@ -46,13 +46,18 @@ _FIELD_ELEMENT_RE = __import__("re").compile(
 def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> tuple:
     """Scan downstream tools of `origin_tool_id` and return:
 
-      (column_names: list[str], string_typed_columns: set[str])
+      (column_names: list[str], string_typed_columns: set[str],
+       numeric_typed_columns: set[str])
 
-    The second set lists columns the workflow's downstream tools use with
-    `.str.` accessors / Alteryx string functions (Trim, Replace, Substring,
-    UpperCase, LowerCase, Contains, StartsWith, Length, ToString) — those
-    MUST be typed as string in the placeholder stub or pandas raises
-    'Can only use .str accessor with string values'.
+    The second set lists columns used with string accessors / Alteryx string
+    functions (Trim, Replace, Substring, UpperCase, LowerCase, Contains,
+    etc.) — they MUST be string-typed in the placeholder stub or pandas
+    raises 'Can only use .str accessor with string values'.
+
+    The third set lists columns used in numeric contexts — summarize
+    aggregations (Sum/Avg/Mean/Min/Max/StdDev/Median), tile, running total,
+    arithmetic in formulas. They MUST be numeric or pd.agg() raises
+    'agg function failed [how->mean,dtype->object]'.
     """
     import xml.etree.ElementTree as _ET
     by_id = wf.by_id()
@@ -60,10 +65,8 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> tupl
     stack = [e.dest_tool for e in wf.downstreams_of(origin_tool_id)]
     cols: set = set()
     str_cols: set = set()
+    num_cols: set = set()
 
-    # Alteryx formula functions that take a string argument as their first
-    # operand. When we see e.g. `Trim([Pay Rate])`, the column "Pay Rate"
-    # must be string-typed in the placeholder stub.
     _STRING_FNS = (
         "trim", "trimleft", "trimright", "uppercase", "lowercase", "titlecase",
         "left", "right", "substring", "length", "replace", "replacechar",
@@ -71,10 +74,29 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> tupl
         "regex_match", "regex_countmatches", "findstring", "padleft",
         "padright", "tostring", "isempty",
     )
-    _STR_FN_RE = __import__("re").compile(
+    _re = __import__("re")
+    _STR_FN_RE = _re.compile(
         r"\b(?:" + "|".join(_STRING_FNS) + r")\s*\(\s*\[([^\[\]]+)\]",
-        __import__("re").IGNORECASE,
+        _re.IGNORECASE,
     )
+    # Numeric Alteryx formula functions over a bracketed col arg.
+    _NUMERIC_FNS = (
+        "abs", "sqrt", "log", "ln", "exp", "ceil", "floor", "round",
+        "min", "max", "mod", "average", "avg", "sum", "median", "stddev",
+        "tonumber",
+    )
+    _NUM_FN_RE = _re.compile(
+        r"\b(?:" + "|".join(_NUMERIC_FNS) + r")\s*\(\s*\[([^\[\]]+)\]",
+        _re.IGNORECASE,
+    )
+    # `[Col] (+|-|*|/) ...` or `... (+|-|*|/) [Col]` — arithmetic on a bracketed
+    # column implies the column is numeric.
+    _ARITH_FIELD_RE = _re.compile(r"\[([^\[\]]+)\]\s*[+\-*/]|[+\-*/]\s*\[([^\[\]]+)\]")
+    # Summarize aggregation action attrs that need numeric input.
+    _NUM_AGG_ACTIONS = {
+        "sum", "avg", "average", "mean", "median", "stddev",
+        "stdev", "variance", "var", "min", "max",
+    }
 
     while stack:
         tid = stack.pop()
@@ -92,10 +114,27 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> tupl
         cols.update(_EXPRESSION_ATTR_RE.findall(cfg_text))
         cols.update(_RENAME_ATTR_RE.findall(cfg_text))
         cols.update(text for _tag, text in _FIELD_ELEMENT_RE.findall(cfg_text))
-        # String-function detection — if Trim/Replace/etc. wraps a bracketed
-        # field anywhere in this tool's config, mark the column as string-typed.
         for m in _STR_FN_RE.finditer(cfg_text):
             str_cols.add(m.group(1))
+        for m in _NUM_FN_RE.finditer(cfg_text):
+            num_cols.add(m.group(1))
+        for m in _ARITH_FIELD_RE.finditer(cfg_text):
+            for grp in m.groups():
+                if grp:
+                    num_cols.add(grp)
+        # Summarize: <SummarizeField field="X" action="Sum"/>
+        for sf in node.config.findall(".//SummarizeField"):
+            action = (sf.attrib.get("action") or "").lower()
+            field = sf.attrib.get("field") or ""
+            if field and action in _NUM_AGG_ACTIONS:
+                num_cols.add(field)
+        # Tile / RunningTotal / NumericTransform: <Field>X</Field>
+        plugin = (node.plugin or "").lower()
+        if any(t in plugin for t in ("tile", "runningtotal", "running_total")):
+            for fld in node.config.findall(".//Field"):
+                fname = (fld.text or fld.attrib.get("field") or "").strip()
+                if fname and fname != "*Unknown":
+                    num_cols.add(fname)
         stack.extend(e.dest_tool for e in wf.downstreams_of(tid))
     out: list = []
     for c in cols:
@@ -105,23 +144,28 @@ def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> tupl
             continue
         if c not in out:
             out.append(c)
-    return out, str_cols
+    return out, str_cols, num_cols
 
 
-def _stub_value_literal_for(col: str, force_string: bool = False) -> str:
+def _stub_value_literal_for(col: str, force_string: bool = False, force_numeric: bool = False) -> str:
     """Pick a Python literal for a stub-row column based on the column name.
 
     `force_string=True` overrides the heuristic and always returns a
     string literal — used when downstream tools apply `.str.` accessors or
-    Alteryx string functions (Trim / Replace / Substring / etc.) to the
-    column, where a numeric value would crash with
-    'Can only use .str accessor with string values'.
+    string functions (Trim / Replace / Substring / etc.) to the column.
+
+    `force_numeric=True` returns an int literal — used when downstream
+    tools aggregate or arithmetic the column (sum / avg / mean / `+ - * /`
+    in formulas), where a string value would crash with
+    'agg function failed [how->mean,dtype->object]'.
 
     Mixed (default): columns whose names strongly suggest numeric use get
     an int (so arithmetic works); columns whose names suggest text get a
     string (so `.str.X` ops work). Date-like names get an ISO timestamp.
     """
     n = col.lower()
+    if force_numeric and not force_string:
+        return "1"
     if "date" in n or "time" in n or "_at" in n:
         return '"2020-01-01"'
     if force_string:
@@ -248,14 +292,19 @@ def import_workflow(
             return ph_name
         placeholder_assets_emitted.add(origin_tool_id)
 
-        cols, string_typed = _columns_needed_downstream(wf, origin_tool_id)
+        cols, string_typed, numeric_typed = _columns_needed_downstream(wf, origin_tool_id)
         if not cols:
             cols = ["col1", "col2", "col3"]  # safe non-empty default
 
-        # Per-column dtype hint: force string when downstream uses .str.X
-        # accessors / Alteryx string functions on that column.
+        # Per-column dtype hint: numeric wins if both numeric and string ops
+        # are used (string ops can usually accept numeric via to_str but agg
+        # on string crashes hard).
         row_literal = "[" + ", ".join(
-            _stub_value_literal_for(c, force_string=(c in string_typed))
+            _stub_value_literal_for(
+                c,
+                force_string=(c in string_typed and c not in numeric_typed),
+                force_numeric=(c in numeric_typed),
+            )
             for c in cols
         ) + "]"
 
