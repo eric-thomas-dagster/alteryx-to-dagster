@@ -2428,6 +2428,173 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     # Spatial — drop-ins for Alteryx spatial tools
     "AlteryxSpatialPluginsGui.CreatePoints.CreatePoints": _map_create_points,
     "AlteryxSpatialPluginsGui.PolySplit.PolySplit": _map_poly_split,
+    "AlteryxSpatialPluginsGui.Distance.Distance": (
+        # Distance: distance between two point geometries (Origin / Destination).
+        # Alteryx config has <Origin field=...> and <Destination field=...> for
+        # the geometry columns; we don't get lat/lng split out so we ask the
+        # user to set the lat1/lng1/lat2/lng2 columns in the emitted defs.yaml.
+        lambda node, upstreams: MappedTool(
+            component_id="distance_calculator",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "lat1_column": "Origin_Lat",
+                "lng1_column": "Origin_Lng",
+                "lat2_column": "Destination_Lat",
+                "lng2_column": "Destination_Lng",
+                "output_column": "distance_km",
+                "unit": "km",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Distance on tool {node.tool_id}: emitted with placeholder "
+                "lat/lng column names — set lat1_column / lng1_column / "
+                "lat2_column / lng2_column in defs.yaml to match your data."
+            ],
+        )
+    ),
+    "AlteryxSpatialPluginsGui.FindNearest.FindNearest": (
+        # FindNearest: find K nearest points in target set per source point.
+        # Maps to nearest_neighbors which uses feature_columns (lat/lng + any
+        # other attributes the user wants in the distance metric).
+        lambda node, upstreams: MappedTool(
+            component_id="nearest_neighbors",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "feature_columns": ["latitude", "longitude"],
+                "n_neighbors": 5,
+                "metric": "euclidean",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"FindNearest on tool {node.tool_id}: emitted with default "
+                "feature_columns=[latitude, longitude]. Adjust to match your "
+                "data's lat/lng column names. For real-world distances use "
+                "metric='haversine' (geographic) instead of euclidean."
+            ],
+        )
+    ),
+    "AlteryxSpatialPluginsGui.SpatialMatch.SpatialMatch": (
+        # SpatialMatch: point-in-polygon test (or geometry intersection).
+        # Maps to spatial_join (two-input: points + regions). Falls back to
+        # point_in_polygon when there's only one upstream.
+        lambda node, upstreams: MappedTool(
+            component_id="spatial_join" if len(upstreams) > 1 else "point_in_polygon",
+            asset_name=_asset_name_for(node),
+            attributes=(
+                {
+                    "upstream_asset_key": upstreams[0],
+                    "regions_asset_key": upstreams[1],
+                    "lat_column": "latitude",
+                    "lng_column": "longitude",
+                    "group_name": "alteryx_imported",
+                }
+                if len(upstreams) > 1
+                else {
+                    "upstream_asset_key": _single_upstream(upstreams),
+                    "lat_column": "latitude",
+                    "lng_column": "longitude",
+                    "output_column": "region",
+                    "group_name": "alteryx_imported",
+                }
+            ),
+            notes=[
+                f"SpatialMatch on tool {node.tool_id}: routed to "
+                f"{('spatial_join' if len(upstreams) > 1 else 'point_in_polygon')}. "
+                "Confirm lat_column / lng_column match your data. For "
+                "point_in_polygon, set geojson_path or geojson_url to the "
+                "polygon source."
+            ],
+        )
+    ),
+    "AlteryxSpatialPluginsGui.PolyBuild.PolyBuild": (
+        # PolyBuild → poly_build component. Alteryx config:
+        # <SequenceField> ordering within ring, <GroupField> identifies each
+        # polygon, <Field>/<XField>/<YField> for vertex coords.
+        lambda node, upstreams: MappedTool(
+            component_id="poly_build",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "group_column": (
+                    (_find_first(node.config, "GroupField", "Group", "GroupBy").text or "group")
+                    if _find_first(node.config, "GroupField", "Group", "GroupBy") is not None else "group"
+                ),
+                "sequence_column": (
+                    (_find_first(node.config, "SequenceField", "Sequence", "Order").text or "sequence")
+                    if _find_first(node.config, "SequenceField", "Sequence", "Order") is not None else "sequence"
+                ),
+                "latitude_column": "Latitude",
+                "longitude_column": "Longitude",
+                "output_type": "polygon",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"PolyBuild on tool {node.tool_id}: defaults to latitude/longitude "
+                "column names — Alteryx stores them as Y/X fields, often unnamed. "
+                "Update latitude_column / longitude_column to match your data."
+            ],
+        )
+    ),
+    "AlteryxSpatialPluginsGui.SpatialInfo.SpatialInfo": (
+        # SpatialInfo → spatial_info component: appends area / length / centroid
+        # / bounds / geom_type columns.
+        lambda node, upstreams: MappedTool(
+            component_id="spatial_info",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "geometry_column": "geometry",
+                "metrics": ["area", "length", "centroid", "bounds", "geom_type"],
+                "area_unit": "sq_miles",
+                "length_unit": "miles",
+                "group_name": "alteryx_imported",
+            },
+        )
+    ),
+    "AlteryxSpatialPluginsGui.MapInput.MapInput": (
+        # MapInput → file_ingestion. Alteryx MapInput accepts shapefiles,
+        # GeoJSON, KML, etc. file_ingestion handles them via format=auto on
+        # the extension. User sets file_path in the emitted defs.yaml.
+        lambda node, upstreams: MappedTool(
+            component_id="file_ingestion",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "file_path": "TODO_set_path_to_geometry_file_or_cloud_url",
+                "format": "auto",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"MapInput on tool {node.tool_id}: set file_path to a shapefile / "
+                "GeoJSON / KML on disk or in cloud object storage. Alteryx's "
+                "interactive map editor doesn't translate; the file path is the "
+                "Dagster-deployable equivalent."
+            ],
+        )
+    ),
+    "AlteryxSpatialPluginsGui.TradeArea.TradeArea": (
+        # TradeArea has two modes: straight-line buffer (geo_buffer) or
+        # drive-time (drive_time). Default to drive_time since that's the
+        # more common Alteryx use; user can swap to geo_buffer in defs.yaml.
+        lambda node, upstreams: MappedTool(
+            component_id="drive_time",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "drive_minutes": 15,
+                "provider": "openrouteservice",
+                "geometry_column": "geometry",
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"TradeArea on tool {node.tool_id}: defaulted to drive_time "
+                "(15-min isochrone via openrouteservice). For straight-line "
+                "TradeArea, swap to component_id=geo_buffer with distance + "
+                "units in the emitted defs.yaml."
+            ],
+        )
+    ),
     # Data Investigation
     "AlteryxBasePluginsGui.PearsonCorrelation.PearsonCorrelation": (
         lambda node, upstreams: MappedTool(

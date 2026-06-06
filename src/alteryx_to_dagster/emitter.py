@@ -69,7 +69,13 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "geo_simplify": "GeoSimplifyComponent",
     "pearson_correlation": "PearsonCorrelationComponent",
     "per_row_http_fetcher": "PerRowHttpFetcherComponent",
-    "data_cleansing": "DataCleansingComponent",
+    # Spatial — new geo components from v0.5.13
+    "poly_build": "PolyBuildComponent",
+    "spatial_info": "SpatialInfoComponent",
+    "distance_calculator": "DistanceCalculatorComponent",
+    "nearest_neighbors": "NearestNeighborsComponent",
+    "point_in_polygon": "PointInPolygonComponent",
+    "spatial_join": "SpatialJoinComponent",
     # Predictive — sklearn-backed registry components (with model_path joblib save)
     "linear_regression_model": "LinearRegressionModelComponent",
     "logistic_regression_model": "LogisticRegressionModelComponent",
