@@ -2518,25 +2518,52 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
         )
     ),
     "AlteryxBasePluginsGui.DynamicRename.DynamicRename": (
-        # Alteryx Dynamic Rename: pattern-based column renaming (e.g. prefix all
-        # cols with "raw_", or take col names from another row of data).
-        # Map to select_columns with no explicit rename — the user fills in
-        # the rename pattern in the emitted defs.yaml.
-        lambda node, upstreams: MappedTool(
-            component_id="select_columns",
+        # DynamicRename → dynamic_rename (NEW registry component).
+        # Alteryx <RenameMode> values map to dynamic_rename modes:
+        #   FirstRow → first_row
+        #   Add Prefix → add_prefix (with <Prefix>...</Prefix>)
+        #   Add Suffix → add_suffix (with <Suffix>...</Suffix>)
+        #   Remove Prefix → replace (pattern = "^<prefix>")
+        #   Take Field Names from Right Input Rows → mapping_from_column
+        #   Take Field Names from First Row of Data → first_row
+        lambda node, upstreams: (lambda rm_el, pfx_el, sfx_el: MappedTool(
+            component_id="dynamic_rename",
             asset_name=_asset_name_for(node),
             attributes={
                 "upstream_asset_key": _single_upstream(upstreams),
-                "rename": {},
+                "mode": (
+                    {
+                        "firstrow": "first_row",
+                        "addprefix": "add_prefix",
+                        "addsuffix": "add_suffix",
+                        "removeprefix": "replace",
+                        "removesuffix": "replace",
+                        "takefieldnamesfromrightinputrows": "mapping_from_column",
+                        "takefromrow": "first_row",
+                    }.get(
+                        ((rm_el.text or "").strip().replace(" ", "").lower())
+                        if rm_el is not None and rm_el.text else "",
+                        "first_row",  # safe default — most common Alteryx use
+                    )
+                ),
+                **(
+                    {"prefix": pfx_el.text.strip()}
+                    if pfx_el is not None and pfx_el.text else {}
+                ),
+                **(
+                    {"suffix": sfx_el.text.strip()}
+                    if sfx_el is not None and sfx_el.text else {}
+                ),
                 "group_name": "alteryx_imported",
             },
             notes=[
-                f"DynamicRename on tool {node.tool_id}: Alteryx's pattern-based "
-                "renaming (use header row / prefix / suffix / regex) doesn't have "
-                "a 1:1 mapping. Emitted with empty `rename:` — fill in the column "
-                "name pairs explicitly in defs.yaml."
+                f"DynamicRename on tool {node.tool_id}: Alteryx RenameMode "
+                f"{(rm_el.text if rm_el is not None and rm_el.text else 'FirstRow')!r} → "
+                f"dynamic_rename mode. For 'replace' modes, also set `pattern:` "
+                "in defs.yaml. For 'mapping_from_column', set "
+                "mapping_asset_key + mapping_key_column + mapping_value_column."
             ],
-        )
+        ))(node.config.find("RenameMode"), node.config.find("Prefix"), node.config.find("Suffix"))
     ),
     "AlteryxBasePluginsGui.MultiRowFormula.MultiRowFormula": (
         # Alteryx Multi-Row Formula uses [Row-1:Col] / [Row+1:Col] windowed
