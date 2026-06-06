@@ -2558,17 +2558,17 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     "AlteryxSpatialPluginsGui.FindNearest.FindNearest": (
         # FindNearest: find K nearest points in target set per source point.
         # Alteryx config has <Target SpatialObj="X"/> and <Universe SpatialObj="Y"/>.
-        # nearest_neighbors uses feature_columns (raw numeric columns). We
-        # extract the geometry column name + emit placeholder lat/lng cols
-        # derived from it.
+        # nearest_neighbors uses feature_columns (raw numeric columns). The
+        # placeholder column scanner sees the geometry column name from the
+        # XML — emit it as the single feature so placeholders include it.
+        # For real workflows the user replaces with [Store_lat, Store_lng].
         lambda node, upstreams: (lambda tgt_el, uni_el: MappedTool(
             component_id="nearest_neighbors",
             asset_name=_asset_name_for(node),
             attributes={
                 "upstream_asset_key": _single_upstream(upstreams),
                 "feature_columns": [
-                    ((tgt_el.attrib.get("SpatialObj", "Target") if tgt_el is not None else "Target") + "_x"),
-                    ((tgt_el.attrib.get("SpatialObj", "Target") if tgt_el is not None else "Target") + "_y"),
+                    tgt_el.attrib.get("SpatialObj", "Target") if tgt_el is not None else "Target",
                 ],
                 "n_neighbors": int((node.config.find("HowMany").attrib.get("value", "5")) if node.config.find("HowMany") is not None else 5),
                 "metric": "euclidean",
@@ -2578,9 +2578,10 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
                 f"FindNearest on tool {node.tool_id}: target geometry "
                 f"{(tgt_el.attrib.get('SpatialObj') if tgt_el is not None else 'Target')!r}, "
                 f"universe geometry {(uni_el.attrib.get('SpatialObj') if uni_el is not None else 'Universe')!r}. "
-                "Replace feature_columns in defs.yaml with the actual numeric "
-                "columns to compare on (e.g. [Store_lat, Store_lng]), and "
-                "consider metric='haversine' for geographic distance."
+                "feature_columns defaults to the geometry column name — "
+                "replace with actual numeric columns to compare on "
+                "(e.g. [Store_lat, Store_lng]) for meaningful distance. "
+                "Consider metric='haversine' for geographic distance."
             ],
         ))(node.config.find("Target"), node.config.find("Universe"))
     ),
