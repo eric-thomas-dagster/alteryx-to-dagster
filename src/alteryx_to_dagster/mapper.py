@@ -2022,11 +2022,18 @@ def _map_find_replace(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Alteryx Find Replace → `find_replace` registry component.
 
     Two inputs: main (the rows being edited) + lookup (find/replace pairs).
-    FieldFind / FieldReplace / FieldSearch elements name the columns.
+    Alteryx XML:
+      <FieldFind>X</FieldFind>             — column in LOOKUP to match against
+      <FieldSearch>Y</FieldSearch>          — column in MAIN to look up
+      <ReplaceFoundField>Z</ReplaceFoundField> — column in LOOKUP with replacement
+    The replacement-column element is named ReplaceFoundField (NOT FieldReplace,
+    despite the naming pattern of the other two).
     """
     cfg = node.config
     find_field_el = cfg.find("FieldFind")
-    replace_field_el = cfg.find("FieldReplace")
+    # `ReplaceFoundField` is the canonical Alteryx element; FieldReplace is a
+    # secondary name some older or custom configs use. Try both via _find_first.
+    replace_field_el = _find_first(cfg, "ReplaceFoundField", "FieldReplace")
     search_field_el = cfg.find("FieldSearch")
     find_field = (find_field_el.text or "find").strip() if find_field_el is not None and find_field_el.text else "find"
     replace_field = (replace_field_el.text or "replace").strip() if replace_field_el is not None and replace_field_el.text else "replace"
