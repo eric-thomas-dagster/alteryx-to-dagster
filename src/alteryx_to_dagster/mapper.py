@@ -2180,9 +2180,12 @@ def _map_cross_tab(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
                 method = method_display.lower()
     # Normalize Alteryx aggregate names to pandas pivot_table conventions.
     method = {"countdistinct": "nunique", "concat": "first"}.get(method, method)
-    # Alteryx CrossTab prefixes each pivoted column with the method name +
-    # underscore (e.g. method="Avg" → `Avg_Speed`, `Avg_Acceleration`).
-    # Capture that so downstream tools resolve those column names.
+    # Alteryx CrossTab column naming: prefer Alteryx's own saved <MetaInfo>
+    # field names as the source of truth. The engine emits column names like
+    # `Avg_Speed` for some methods (Avg / Median / StdDev) and bare header
+    # values like `Burger` / `2014_` for others (Sum / Concat / First / etc.).
+    # If MetaInfo contains a non-group field that starts with `<Method>_`,
+    # Alteryx is using the prefix and we should match. Otherwise emit bare.
     _attrs: Dict[str, object] = {
         "upstream_asset_key": _single_upstream(upstreams),
         "index_columns": group_by,
@@ -2192,7 +2195,14 @@ def _map_cross_tab(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
         "group_name": "alteryx_imported",
     }
     if method_display:
-        _attrs["column_prefix"] = f"{method_display}_"
+        _emitted_names = node.output_field_names()
+        _group_set = set(group_by)
+        _non_group = [n for n in _emitted_names if n not in _group_set]
+        _alteryx_uses_prefix = any(
+            n.startswith(f"{method_display}_") for n in _non_group
+        )
+        if _alteryx_uses_prefix:
+            _attrs["column_prefix"] = f"{method_display}_"
     return MappedTool(
         component_id="pivot",
         asset_name=_asset_name_for(node),

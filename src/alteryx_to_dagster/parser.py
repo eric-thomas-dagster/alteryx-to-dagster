@@ -45,12 +45,32 @@ class AlteryxNode:
     annotation: Optional[str]  # user-set tool label, often useful as asset_name
     config: ET.Element         # raw <Configuration> element for the mapper
     position: Dict[str, float] # {"x": ..., "y": ...} — kept for layout debugging
+    meta_info: Optional[ET.Element] = None  # <MetaInfo> sibling (output schema Alteryx saved)
 
     @property
     def plugin_short(self) -> str:
         """e.g. 'Filter' from 'AlteryxBasePluginsGui.Filter.Filter'."""
         parts = self.plugin.split(".")
         return parts[-1] if parts else self.plugin
+
+    def output_field_names(self) -> List[str]:
+        """Field names Alteryx itself recorded for this tool's Output anchor.
+
+        Authoritative when the user-saved workflow includes a `<MetaInfo
+        connection="Output"><RecordInfo><Field name="..."/></RecordInfo>...`
+        block (most non-trivial tools do). Returns an empty list if the
+        workflow didn't save metadata — common for newly-dropped tools that
+        haven't been run yet.
+        """
+        if self.meta_info is None:
+            return []
+        names: List[str] = []
+        for ri in self.meta_info.findall(".//RecordInfo"):
+            for f in ri.findall("Field"):
+                n = f.attrib.get("name")
+                if n:
+                    names.append(n)
+        return names
 
 
 @dataclass
@@ -174,6 +194,16 @@ def _from_root(root: ET.Element) -> AlteryxWorkflow:
         cfg_el = props_el.find("Configuration") if props_el is not None else None
         if cfg_el is None:
             cfg_el = ET.Element("Configuration")
+        # MetaInfo is a Properties-level sibling of Configuration. Alteryx
+        # saves the tool's output schema here (column names + types) after
+        # the workflow has been run. Hand that to the mapper so it doesn't
+        # need to guess column-naming conventions.
+        meta_info_el: Optional[ET.Element] = None
+        if props_el is not None:
+            for _mi in props_el.findall("MetaInfo"):
+                if _mi.attrib.get("connection") in ("Output", "", None):
+                    meta_info_el = _mi
+                    break
         if tool_id:
             wf.nodes.append(AlteryxNode(
                 tool_id=tool_id,
@@ -181,6 +211,7 @@ def _from_root(root: ET.Element) -> AlteryxWorkflow:
                 annotation=annotation,
                 config=cfg_el,
                 position=position,
+                meta_info=meta_info_el,
             ))
         # Alteryx Tool Containers + Apps nest inner tools under <ChildNodes>.
         # Recurse so we capture the inner workflow's compute tools — without
