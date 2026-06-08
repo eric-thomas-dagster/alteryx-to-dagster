@@ -335,38 +335,52 @@ def import_workflow(
         if not cols:
             cols = ["col1", "col2", "col3"]  # safe non-empty default
 
-        # Per-column dtype hint: numeric wins if both numeric and string ops
-        # are used (string ops can usually accept numeric via to_str but agg
-        # on string crashes hard).
-        row_literal = "[" + ", ".join(
-            _stub_value_literal_for(
-                c,
-                force_string=(c in string_typed and c not in numeric_typed),
-                force_numeric=(c in numeric_typed),
-            )
-            for c in cols
-        ) + "]"
+        # Per-column placeholder values — keep them simple Python primitives
+        # so the YAML round-trip is lossless (no repr() / eval() games).
+        def _placeholder_value(c: str):
+            if c in string_typed and c not in numeric_typed:
+                return "x"
+            if c in numeric_typed:
+                return 1
+            # Default: short non-empty string. NaN would survive `.str.` ops
+            # only as object dtype, but pd.read_csv-style stubs already use "x".
+            return "x"
 
-        py = f'''"""Placeholder for Alteryx tool {origin_tool_id} (was unmapped).
+        data_row = [_placeholder_value(c) for c in cols]
 
-The original Alteryx tool's mapping wasn't found in alteryx_to_dagster.mapper.
-This stub returns a 1-row DataFrame whose schema matches what downstream
-tools reference, so the graph at least loads + executes. Replace this with
-the real tool's logic (see MIGRATION.md).
-"""
-import dagster as dg
-import pandas as pd
+        # Detect a downstream Dynamic Rename in `first_row` mode. That mode
+        # PROMOTES the first data row's VALUES into column names — consuming
+        # the single row. When such a consumer exists, emit TWO rows: row 1 =
+        # the literal column-name strings (which become headers after
+        # promotion), row 2 = the per-column placeholder values.
+        _dyn_rename_first_row = False
+        for _e in wf.downstreams_of(origin_tool_id):
+            _dn = wf.by_id().get(_e.dest_tool)
+            if _dn is None:
+                continue
+            if "DynamicRename" not in (_dn.plugin or ""):
+                continue
+            _rm = _dn.config.find("RenameMode") or _dn.config.find(".//RenameMode")
+            if _rm is not None and (_rm.text or "").strip().lower() == "firstrow":
+                _dyn_rename_first_row = True
+                break
 
-
-@dg.asset(
-    name={ph_name!r},
-    group_name="alteryx_unmapped",
-    description="Placeholder for unmapped Alteryx tool {origin_tool_id}. Replace.",
-)
-def {ph_name}() -> pd.DataFrame:
-    return pd.DataFrame([{row_literal}], columns={cols!r})
-'''
-        emit_inline_python(out_dir, pkg, ph_name, py)
+        rows = [list(cols), data_row] if _dyn_rename_first_row else [data_row]
+        emit_yaml(
+            out_dir,
+            pkg,
+            "inline_dataframe",
+            ph_name,
+            {
+                "columns": list(cols),
+                "rows": rows,
+                "group_name": "alteryx_unmapped",
+                "description": (
+                    f"Placeholder for unmapped Alteryx tool {origin_tool_id}. "
+                    "Replace with the real upstream — see MIGRATION.md."
+                ),
+            },
+        )
         return ph_name
 
     for node in ordered:
