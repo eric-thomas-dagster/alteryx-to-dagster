@@ -214,13 +214,61 @@ def _map_filter(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     scope). So we always emit a `filter` defs.yaml regardless of which path
     the translator produces — runtime stays deterministic, no inline .py
     needed for Contains / DateTimeAdd / IIF cases.
+
+    Two Alteryx filter modes:
+      - Custom: <Expression>...</Expression> (translated below).
+      - Simple: <Mode>Simple</Mode><Simple><Operator>=</Operator><Field>X</Field>
+                <Operands><Operand>val</Operand></Operands></Simple>
+        Reconstruct the pandas expression from the structured form.
     """
     expr_el = node.config.find("Expression")
     raw_expr = (expr_el.text or "").strip() if expr_el is not None else ""
     upstream = _single_upstream(upstreams)
     asset_name = _asset_name_for(node)
 
-    # Empty Alteryx filter — emit `True` so the filter passes through.
+    # Simple-mode filter: rebuild a pandas expression from the <Simple>
+    # block when no <Expression> is present. Already valid pandas; skip
+    # the Alteryx-expr translator entirely so it isn't mistranslated
+    # (`df["X"]` is not Alteryx syntax — the translator would double-wrap it).
+    simple_pandas: Optional[str] = None
+    if not raw_expr:
+        simple = node.config.find("Simple")
+        if simple is not None:
+            op_el = simple.find("Operator")
+            field_el = simple.find("Field")
+            operands_el = simple.find("Operands")
+            op = (op_el.text or "=").strip() if op_el is not None and op_el.text else "="
+            field = (field_el.text or "").strip() if field_el is not None and field_el.text else ""
+            operand_el = operands_el.find("Operand") if operands_el is not None else None
+            operand = (operand_el.text or "").strip() if operand_el is not None and operand_el.text else ""
+            if field:
+                # Map Alteryx operators → pandas comparison operators.
+                _OP = {
+                    "=": "==", "==": "==", "!=": "!=", "<>": "!=",
+                    ">": ">", ">=": ">=", "<": "<", "<=": "<=",
+                }
+                py_op = _OP.get(op, "==")
+                # Quote string operands; numeric stays bare.
+                try:
+                    float(operand)
+                    operand_lit = operand
+                except (ValueError, TypeError):
+                    operand_lit = repr(operand)
+                simple_pandas = f'df[{field!r}] {py_op} {operand_lit}'
+
+    if simple_pandas is not None:
+        return MappedTool(
+            component_id="filter",
+            asset_name=asset_name,
+            attributes={
+                "upstream_asset_key": upstream,
+                "condition": simple_pandas,
+                "group_name": "alteryx_imported",
+            },
+            notes=[],
+        )
+
+    # Empty Alteryx filter (no Expression AND no Simple) — emit `True`.
     if not raw_expr:
         return MappedTool(
             component_id="filter",
@@ -435,7 +483,20 @@ def _map_summarize(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
                 if rename and rename != field_name:
                     group_by_rename[field_name] = rename
             else:
-                if rename and rename != field_name:
+                # Alteryx's "Count" action counts ROWS per group, not non-null
+                # values of a specific column. pandas's `groupby.agg("count")`
+                # counts non-nulls — so when Alteryx's field name conflicts
+                # with the desired output name (the common "Count": Count"
+                # pattern), the agg blows up looking for a missing source col.
+                # Map Alteryx Count → "size" (pandas row-count semantic) so
+                # the result is correct AND doesn't depend on the source col.
+                _agg = "size" if action == "count" else action
+                _out = rename or field_name
+                if _agg == "size":
+                    # Single-arg form: summarize component treats `{out: size}`
+                    # as row-count per group regardless of source col.
+                    aggs[_out] = "size"
+                elif rename and rename != field_name:
                     aggs[rename] = {"col": field_name, "agg": action}
                 else:
                     aggs[field_name] = action
@@ -529,64 +590,12 @@ def {asset_name}(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
     left_key = upstreams[0] if upstreams else ""
     right_key = upstreams[1] if len(upstreams) > 1 else ""
 
-    # Self-join detection: when both sides reference the same upstream
-    # asset, Dagster's ins= dict collapses into a single entry which the
-    # dataframe_join compute_fn can't unpack into left+right cleanly.
-    # Emit an inline @dg.asset .py that does `df.merge(df, ...)` with
-    # Alteryx's "Right_<col>" column-naming convention on the right side.
-    if left_key and right_key and left_key == right_key:
-        asset_name = _asset_name_for(node)
-        l_on_repr = repr(join_fields_l)
-        r_on_repr = repr(join_fields_r)
-        # Alteryx prefixes ALL right-side columns with "Right_" (not just
-        # collisions). Pre-rename the right copy of the DataFrame so the
-        # merged output has Right_<col> columns matching what downstream
-        # Alteryx formulas / filters reference.
-        py = f'''"""Alteryx Self-Join (tool {node.tool_id}) — both inputs reference {left_key!r}.
-
-Emitted as inline pandas because Dagster's `ins=` dict requires distinct
-asset_keys per input slot; pandas .merge(df, df) is fine with the same
-underlying frame on both sides.
-
-Right-side columns are prefixed with "Right_" to match Alteryx's
-self-join column-naming convention (downstream Formula / Filter tools
-reference Right_<col>).
-"""
-import dagster as dg
-import pandas as pd
-
-
-@dg.asset(
-    name={asset_name!r},
-    group_name="alteryx_imported",
-    ins={{"upstream": dg.AssetIn(key=dg.AssetKey({left_key!r}))}},
-    description="Alteryx Self-Join (tool {node.tool_id}) — inner merge on {join_fields_l}.",
-)
-def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
-    left = upstream
-    right = upstream.rename(columns=lambda c: f"Right_{{c}}")
-    return left.merge(
-        right,
-        left_on={l_on_repr},
-        right_on=[f"Right_{{c}}" for c in {r_on_repr}],
-        how="inner",
-    )
-'''
-        return MappedTool(
-            component_id="(inline_python)",
-            asset_name=asset_name,
-            inline_python=py,
-            notes=[
-                f"Join on tool {node.tool_id}: SELF-JOIN detected (both inputs "
-                f"are {left_key!r}). Emitted as inline pandas .merge(df, df) "
-                "with right-side columns prefixed 'Right_' to match Alteryx convention."
-            ],
-        )
-
     # Alteryx Joins embed a <SelectConfiguration><SelectFields/> block that
     # renames/drops cols inline. Right-side cols arrive with a Right_ prefix
     # in Alteryx's output; SelectField rename="X" then gives them final names.
     # Forward this to dataframe_join via right_prefix + rename + drop_columns.
+    # Parsed BEFORE the self-join short-circuit so self-joins inherit the same
+    # rename/drop wiring.
     embedded_select = node.config.find("SelectConfiguration")
     if embedded_select is None:
         embedded_select = node.config.find(".//SelectFields")
@@ -607,6 +616,36 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
                     post_drop.append(fname)
                 elif rename and rename != fname:
                     post_rename[fname] = rename
+
+    # Self-join: when both sides reference the same upstream asset, the
+    # dataframe_join component supports it natively — right_asset_key gets
+    # omitted (or set equal to left_asset_key), the component clones `left`
+    # in-process and prefixes its non-key columns with `right_prefix`.
+    # Downstream Alteryx tools that reference `Right_<col>` resolve correctly.
+    if left_key and right_key and left_key == right_key:
+        self_attrs: Dict[str, Any] = {
+            "left_asset_key": left_key,
+            # right_asset_key intentionally omitted → self-join mode.
+            "left_on": join_fields_l,
+            "right_on": join_fields_r,
+            "how": "inner",
+            "right_prefix": "Right_",
+            "group_name": "alteryx_imported",
+        }
+        if post_rename:
+            self_attrs["rename"] = post_rename
+        if post_drop:
+            self_attrs["drop_columns"] = post_drop
+        return MappedTool(
+            component_id="dataframe_join",
+            asset_name=_asset_name_for(node),
+            attributes=self_attrs,
+            notes=[
+                f"Join on tool {node.tool_id}: self-join detected (both inputs "
+                f"are {left_key!r}). Mapped to dataframe_join's self-join mode "
+                "with right_prefix='Right_'."
+            ],
+        )
 
     attrs: Dict[str, Any] = {
         "left_asset_key": left_key,
@@ -637,13 +676,23 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_union(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    # Alteryx Union has two modes: ByName (default) and ByPos (Join By
+    # Record Position). ByPos takes column names from the first input
+    # and aligns subsequent inputs positionally — common when the user
+    # unions sources with different first-col names (drivers.csv has
+    # "Driver" as col1, tires.csv has "Tire", etc.).
+    _mode_el = node.config.find("Mode")
+    _mode = (_mode_el.text or "").strip() if _mode_el is not None and _mode_el.text else "ByName"
+    attrs: Dict[str, object] = {
+        "upstream_asset_keys": upstreams,
+        "group_name": "alteryx_imported",
+    }
+    if _mode == "ByPos":
+        attrs["mode"] = "by_position"
     return MappedTool(
         component_id="dataframe_union",
         asset_name=_asset_name_for(node),
-        attributes={
-            "upstream_asset_keys": upstreams,
-            "group_name": "alteryx_imported",
-        },
+        attributes=attrs,
     )
 
 
@@ -716,6 +765,48 @@ def _map_input_csv(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
         file_el = node.config.find("Connection")
     file_path = (file_el.text or "").strip() if file_el is not None else ""
 
+    # Database connection-string forms used by Input Data:
+    #   odbc:DSN=mydsn;UID=u;PWD=p|||SELECT * FROM tbl
+    #   oledb:Provider=SQLOLEDB.1;Data Source=host;Initial Catalog=db|||SELECT ...
+    #   aka:My_Alias\nSourceData=...\nDSN=mydsn|||SELECT ...
+    #   Provider=SQLOLEDB.1;...|||SELECT ...     (raw OLE-DB; no prefix)
+    # Detect these BEFORE the per-extension routing — the path has no file
+    # extension but does have `|||<query>` separating connection from SQL.
+    _looks_like_dsn = (
+        file_path.lower().startswith(("odbc:", "oledb:", "aka:"))
+        or "Provider=" in file_path
+        or "DSN=" in file_path
+        or file_path.lower().startswith(("mssql+", "postgresql+", "mysql+",
+                                         "oracle+", "snowflake://", "redshift+"))
+    )
+    if "|||" in file_path and _looks_like_dsn:
+        _conn_str, _query = file_path.split("|||", 1)
+        _query = _query.strip()
+        # Synthesize a stable env-var name from the connection string so
+        # users can keep secrets out of source. Hash to keep the var name
+        # short / consistent across re-imports of the same connection.
+        import hashlib as _hl
+        _conn_id = _hl.sha1(_conn_str.encode("utf-8")).hexdigest()[:8].upper()
+        _env_var = f"ALTERYX_DB_{_conn_id}_URL"
+        return MappedTool(
+            component_id="dataframe_from_sql",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "query": _query,
+                "database_url_env_var": _env_var,
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"Input Data on tool {node.tool_id}: Alteryx connection string "
+                f"detected ({_conn_str[:80]!r}). Mapped to dataframe_from_sql. "
+                f"Set ${_env_var} to a SQLAlchemy URL — for ODBC sources use "
+                f"`mssql+pyodbc:///?odbc_connect=<urlencoded connection-string>` "
+                f"(other drivers: `postgresql+psycopg2://...`, "
+                f"`oracle+cx_oracle://...`, `snowflake://...`). "
+                f"Original query: {_query[:120]}"
+            ],
+        )
+
     # Alteryx Excel paths include a `|||Sheet1$` (or `|||<NamedRange>`)
     # suffix to specify the worksheet. The DataframeFromExcelComponent
     # accepts a sheet_name field separately, so strip the suffix off the
@@ -765,6 +856,42 @@ def _map_input_csv(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
         "group_name": "alteryx_imported",
         **extra_attrs,
     }
+    # Alteryx Input Data emits a FileName metadata column with the source
+    # basename — required by chains that group_by FileName (e.g. Mario Kart
+    # unions multiple CSVs and groups by source). The XML may name this
+    # column via `<File OutputFileName="...">`; default to "FileName".
+    if component_id == "dataframe_from_csv":
+        attrs["add_filename_column"] = True
+        if file_el is not None:
+            _fn_col = file_el.attrib.get("OutputFileName") or "FileName"
+            attrs["filename_column_name"] = _fn_col
+        # Parse <FormatSpecificOptions> for delimiter / encoding / header_row.
+        # Alteryx Mario Kart sample uses `;` delimiter + cp1252 (CodePage=28591).
+        _fopts = node.config.find("FormatSpecificOptions")
+        if _fopts is not None:
+            _delim_el = _fopts.find("Delimeter") or _fopts.find("Delimiter")
+            if _delim_el is not None and _delim_el.text:
+                _delim = _delim_el.text
+                # Alteryx encodes tab as `\t`; pandas accepts literal tab.
+                if _delim == "\\t":
+                    _delim = "\t"
+                attrs["delimiter"] = _delim
+            _cp_el = _fopts.find("CodePage")
+            if _cp_el is not None and _cp_el.text:
+                # Common code pages → Python encoding names
+                _CP_MAP = {
+                    "65001": "utf-8",
+                    "28591": "latin-1",   # ISO-8859-1
+                    "1252": "cp1252",
+                    "1250": "cp1250",
+                    "20127": "ascii",
+                }
+                _enc = _CP_MAP.get(_cp_el.text.strip())
+                if _enc:
+                    attrs["encoding"] = _enc
+            _hdr_el = _fopts.find("HeaderRow")
+            if _hdr_el is not None and (_hdr_el.text or "").strip().lower() == "false":
+                attrs["skiprows"] = 0  # not really right but preserves intent
     return MappedTool(
         component_id=component_id,
         asset_name=_asset_name_for(node),
@@ -2041,6 +2168,7 @@ def _map_cross_tab(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     if vf is not None:
         value_field = vf.attrib.get("field") or (vf.text or "").strip() or None
     methods = cfg.find("Methods")
+    method_display = ""  # capitalized form for column-prefix (e.g. "Avg")
     if methods is not None:
         m = methods.find("Method")
         if m is not None:
@@ -2048,26 +2176,27 @@ def _map_cross_tab(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
             # OR as the element text — handle both.
             method_raw = m.attrib.get("method") or (m.text or "")
             if method_raw:
-                method = method_raw.strip().lower()
+                method_display = method_raw.strip()
+                method = method_display.lower()
     # Normalize Alteryx aggregate names to pandas pivot_table conventions.
     method = {"countdistinct": "nunique", "concat": "first"}.get(method, method)
+    # Alteryx CrossTab prefixes each pivoted column with the method name +
+    # underscore (e.g. method="Avg" → `Avg_Speed`, `Avg_Acceleration`).
+    # Capture that so downstream tools resolve those column names.
+    _attrs: Dict[str, object] = {
+        "upstream_asset_key": _single_upstream(upstreams),
+        "index_columns": group_by,
+        "pivot_column": header_field,
+        "value_column": value_field,
+        "agg_func": method,
+        "group_name": "alteryx_imported",
+    }
+    if method_display:
+        _attrs["column_prefix"] = f"{method_display}_"
     return MappedTool(
         component_id="pivot",
         asset_name=_asset_name_for(node),
-        attributes={
-            "upstream_asset_key": _single_upstream(upstreams),
-            # Registry's PivotComponent field names — these don't match pandas
-            # (or what _map_cross_tab emitted in v0.4). Spec:
-            #   index_columns: List[str] → group keys that stay as rows
-            #   pivot_column: str        → column whose values become new headers
-            #   value_column: str        → column whose values fill the pivoted cells
-            #   agg_func: str            → 'sum' / 'mean' / 'count' / 'min' / 'max' / 'first' / 'last'
-            "index_columns": group_by,
-            "pivot_column": header_field,
-            "value_column": value_field,
-            "agg_func": method,
-            "group_name": "alteryx_imported",
-        },
+        attributes=_attrs,
     )
 
 
@@ -2301,13 +2430,20 @@ def _map_generate_rows(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
 def _map_find_replace(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Alteryx Find Replace → `find_replace` registry component.
 
-    Two inputs: main (the rows being edited) + lookup (find/replace pairs).
-    Alteryx XML:
-      <FieldFind>X</FieldFind>             — column in LOOKUP to match against
-      <FieldSearch>Y</FieldSearch>          — column in MAIN to look up
-      <ReplaceFoundField>Z</ReplaceFoundField> — column in LOOKUP with replacement
-    The replacement-column element is named ReplaceFoundField (NOT FieldReplace,
-    despite the naming pattern of the other two).
+    Two inputs: Source (the find/replace lookup pairs) + Targets (the main
+    records being edited). Alteryx anchors are literally `Source` and `Targets`.
+
+    Alteryx XML field naming is COUNTERINTUITIVE — verified against a real
+    workflow where Source had ['Stop_Words', 'Blank'] and Targets had ['lyric'],
+    with FieldFind=lyric and FieldSearch=Stop_Words:
+      <FieldFind>X</FieldFind>            — "Find Within Field": column in
+                                            TARGETS (main records) to scan.
+      <FieldSearch>Y</FieldSearch>        — "Find Value": column in SOURCE
+                                            (lookup) providing values to find.
+      <ReplaceFoundField>Z</ReplaceFoundField> — column in SOURCE (lookup) with
+                                            replacement values.
+    The element name `ReplaceFoundField` is canonical; older/custom configs
+    occasionally use `FieldReplace` as an alias.
     """
     cfg = node.config
     find_field_el = cfg.find("FieldFind")
@@ -2315,20 +2451,54 @@ def _map_find_replace(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     # secondary name some older or custom configs use. Try both via _find_first.
     replace_field_el = _find_first(cfg, "ReplaceFoundField", "FieldReplace")
     search_field_el = cfg.find("FieldSearch")
+    # ReplaceMode controls whether the lookup value overwrites the target
+    # column ("Replace") or appends as a new column named for the lookup's
+    # value field ("Append"). The XML may also list explicit appended fields
+    # under `<ReplaceAppendFields>`; we honor either signal.
+    mode_el = cfg.find("ReplaceMode")
+    append_fields_el = cfg.find("ReplaceAppendFields")
+    _has_append_field = append_fields_el is not None and any(
+        _f.attrib.get("field") for _f in append_fields_el.findall("Field")
+    )
+    is_append_mode = (
+        (mode_el is not None and (mode_el.text or "").strip().lower() == "append")
+        or _has_append_field
+    )
     find_field = (find_field_el.text or "find").strip() if find_field_el is not None and find_field_el.text else "find"
     replace_field = (replace_field_el.text or "replace").strip() if replace_field_el is not None and replace_field_el.text else "replace"
     search_field = (search_field_el.text or "value").strip() if search_field_el is not None and search_field_el.text else "value"
+    # Anchor ordering: runner sorts upstreams by dest_anchor alphabetically.
+    # Alteryx FindReplace has anchors `F` (Find — the lookup list) and `R`
+    # (Records — the main data flow). Sorted alphabetically: F first, R second.
+    # So upstreams[0] is the lookup table and upstreams[1] is the records.
+    if len(upstreams) >= 2:
+        _lookup_key, _main_key = upstreams[0], upstreams[1]
+    elif len(upstreams) == 1:
+        # Single-input variant — Alteryx allows a self-replace mode. Use the
+        # one stream for both slots (component will resolve at runtime).
+        _lookup_key = _main_key = upstreams[0]
+    else:
+        _lookup_key = _main_key = ""
+    _attrs: Dict[str, object] = {
+        "upstream_asset_key": _main_key,
+        "lookup_asset_key": _lookup_key,
+        # FieldSearch (Source's value-column) → key column in lookup table
+        # FieldFind (Targets' search-within column) → target column in main
+        "lookup_key_column": search_field,
+        "lookup_value_column": replace_field,
+        "target_column": find_field,
+        "group_name": "alteryx_imported",
+    }
+    # In Append mode, the lookup value lands in a NEW column named for the
+    # lookup's value field instead of overwriting the target. Set
+    # `output_column` to surface it; downstream tools then reference the
+    # value-field name directly.
+    if is_append_mode:
+        _attrs["output_column"] = replace_field
     return MappedTool(
         component_id="find_replace",
         asset_name=_asset_name_for(node),
-        attributes={
-            "upstream_asset_key": upstreams[0] if upstreams else "",
-            "lookup_asset_key": upstreams[1] if len(upstreams) > 1 else "",
-            "lookup_key_column": find_field,
-            "lookup_value_column": replace_field,
-            "target_column": search_field,
-            "group_name": "alteryx_imported",
-        },
+        attributes=_attrs,
     )
 
 
@@ -2418,7 +2588,17 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
             # Polygon: walk the exterior ring.
             coords = list(getattr(geom.exterior, "coords", []))
         return coords
-    df["_coords"] = df[{geom_col!r}].apply(_explode)
+    # Fall back to any geometry-typed col if the configured one is missing
+    # (upstream may emit Centroid / SpatialObj / etc. instead of {geom_col!r}).
+    _geom_col = {geom_col!r}
+    if _geom_col not in df.columns:
+        for _alt in ("geometry", "Centroid", "SpatialObj", "geom", "shape"):
+            if _alt in df.columns:
+                _geom_col = _alt
+                break
+    if _geom_col not in df.columns:
+        return df  # nothing to explode; downstream stays consistent
+    df["_coords"] = df[_geom_col].apply(_explode)
     df = df.explode("_coords").reset_index(drop=True)
     df["x"] = df["_coords"].apply(lambda c: c[0] if c is not None else None)
     df["y"] = df["_coords"].apply(lambda c: c[1] if c is not None else None)
@@ -2514,8 +2694,10 @@ _STOCK_MACRO_COMPONENTS: Dict[str, Any] = {
         "attributes": {"group_by": [], "aggregations": {}},  # whole-frame size
     },
     "weightedavg.yxmc": {
-        "component_id": "summarize",
-        "attributes": {"group_by": [], "aggregations": {}},
+        "component_id": "weighted_average",
+        # Required attributes pulled from the parent <Configuration> at map
+        # time — see _map_alteryx_macro special-case below.
+        "attributes": {},
     },
 }
 
@@ -2553,6 +2735,32 @@ def _map_alteryx_macro(node: AlteryxNode, upstreams: List[str]):
         defaults = dict(stock.get("attributes") or {})  # type: ignore[arg-type]
         defaults.setdefault("upstream_asset_key", _single_upstream(upstreams))
         defaults.setdefault("group_name", "alteryx_imported")
+        # Stock macros that need parent-Configuration-driven attributes:
+        # WeightedAvg.yxmc pulls value/weight/group cols and output name from
+        # the parent <Configuration><Value name=…> entries.
+        if component_id == "weighted_average":
+            cfg = node.config
+            _val = _weight = _group = _out = None
+            for _v in cfg.findall("Value"):
+                _name = _v.attrib.get("name", "")
+                _text = (_v.text or "").strip()
+                if _name == "Value":
+                    _val = _text
+                elif _name == "Weight":
+                    _weight = _text
+                elif _name == "GroupFields":
+                    _group = _text
+                elif _name == "OutputFieldName":
+                    _out = _text
+            if _val:
+                defaults["value_column"] = _val
+            if _weight:
+                defaults["weight_column"] = _weight
+            if _group:
+                # GroupFields is comma-separated in Alteryx XML.
+                defaults["group_by"] = [g.strip() for g in _group.split(",") if g.strip()]
+            if _out:
+                defaults["output_column"] = _out
         return MappedTool(
             component_id=str(component_id),
             asset_name=_asset_name_for(node),
@@ -2949,21 +3157,41 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
         )
     ),
     "PortfolioPluginsGui.ComposerImage.PortfolioComposerImage": (
-        lambda node, upstreams: MappedTool(
-            component_id="pdf_report",
-            asset_name=_asset_name_for(node),
-            attributes={
-                "upstream_asset_key": _single_upstream(upstreams),
-                "file_path": f"./reports/{_asset_name_for(node)}.pdf",
-                "title": (node.annotation or _asset_name_for(node)).strip(),
-                "template": "table",
-                "group_name": "alteryx_imported",
-            },
-            notes=[
-                f"Portfolio Composer Image on tool {node.tool_id}: emitted as "
-                "pdf_report. The image-embedding shape needs an html_template "
-                "with <img> tags pointing at upstream chart-rendering assets."
-            ],
+        # Composer Image renders an image section that the downstream Composer
+        # Render bundles into a PDF. Two shapes:
+        #   - WITH upstream: passthrough (so downstream Union/Join still sees a
+        #     DataFrame, not a PDF path).
+        #   - WITHOUT upstream: standalone image source. Emit a tiny 1-row
+        #     placeholder DataFrame so downstream Union has something to concat.
+        lambda node, upstreams: (
+            MappedTool(
+                component_id="select_columns",
+                asset_name=_asset_name_for(node),
+                attributes={
+                    "upstream_asset_key": _single_upstream(upstreams),
+                    "group_name": "alteryx_imported",
+                },
+                notes=[
+                    f"Portfolio Composer Image on tool {node.tool_id}: emitted as "
+                    "passthrough — image-section rendering has no Dagster-native "
+                    "equivalent mid-chain. Embed via the terminal pdf_report's "
+                    "template='template_html' with <img> tags."
+                ],
+            ) if upstreams else MappedTool(
+                component_id="inline_dataframe",
+                asset_name=_asset_name_for(node),
+                attributes={
+                    "asset_name": _asset_name_for(node),
+                    "columns": ["Image"],
+                    "rows": [[""]],
+                    "group_name": "alteryx_imported",
+                },
+                notes=[
+                    f"Portfolio Composer Image on tool {node.tool_id}: no upstream — "
+                    "emitted as a 1-row placeholder DataFrame so downstream report "
+                    "tools (Render / Union) still have a DataFrame to consume."
+                ],
+            )
         )
     ),
     "PortfolioPluginsGui.ComposerTable.PortfolioComposerTable": (
@@ -2972,20 +3200,40 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
         # Composer Render. Emit as a passthrough so downstream Joins/Unions
         # consume the upstream DataFrame; the table-styling is captured as
         # a MIGRATION.md note for the user to re-apply at the final render.
-        lambda node, upstreams: MappedTool(
-            component_id="select_columns",
-            asset_name=_asset_name_for(node),
-            attributes={
-                "upstream_asset_key": _single_upstream(upstreams),
-                "group_name": "alteryx_imported",
-            },
-            notes=[
-                f"Portfolio Composer Table on tool {node.tool_id}: emitted as "
-                "passthrough — table-styling has no Dagster-native equivalent "
-                "mid-chain. Wire the table render into the terminal pdf_report "
-                "(set template='template_html' with a custom HTML template for "
-                "Alteryx-style styled tables)."
-            ],
+        # If the source workflow wired the Composer Table as a leaf
+        # source-style step with no inbound anchor, fall back to a 1-row
+        # inline_dataframe so the asset still materializes.
+        lambda node, upstreams: (
+            MappedTool(
+                component_id="inline_dataframe",
+                asset_name=_asset_name_for(node),
+                attributes={
+                    "columns": ["placeholder"],
+                    "rows": [[""]],
+                    "group_name": "alteryx_imported",
+                },
+                notes=[
+                    f"Portfolio Composer Table on tool {node.tool_id}: no upstream — "
+                    "emitted as a 1-row inline placeholder. Wire the table render into "
+                    "the terminal pdf_report with template='template_html'."
+                ],
+            )
+            if not upstreams else
+            MappedTool(
+                component_id="select_columns",
+                asset_name=_asset_name_for(node),
+                attributes={
+                    "upstream_asset_key": _single_upstream(upstreams),
+                    "group_name": "alteryx_imported",
+                },
+                notes=[
+                    f"Portfolio Composer Table on tool {node.tool_id}: emitted as "
+                    "passthrough — table-styling has no Dagster-native equivalent "
+                    "mid-chain. Wire the table render into the terminal pdf_report "
+                    "(set template='template_html' with a custom HTML template for "
+                    "styled tables)."
+                ],
+            )
         )
     ),
     "AlteryxBasePluginsGui.DynamicSelect.DynamicSelect": (
@@ -3214,20 +3462,39 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     "PortfolioPluginsGui.ComposerText.PortfolioComposerText": (
         # Same reasoning as ComposerTable — text sections are mid-chain
         # styling, not terminal output. Emit as passthrough so downstream
-        # Join/Union still receives a DataFrame.
-        lambda node, upstreams: MappedTool(
-            component_id="select_columns",
-            asset_name=_asset_name_for(node),
-            attributes={
-                "upstream_asset_key": _single_upstream(upstreams),
-                "group_name": "alteryx_imported",
-            },
-            notes=[
-                f"Portfolio Composer Text on tool {node.tool_id}: emitted as "
-                "passthrough — Alteryx-style headline-text report sections "
-                "have no Dagster-native equivalent. Re-attach text content "
-                "to the terminal pdf_report's html_template."
-            ],
+        # Join/Union still receives a DataFrame. When the text tool has
+        # NO upstream (source-style text block), emit a 1-row inline_dataframe
+        # so the asset is still materializable as an empty placeholder.
+        lambda node, upstreams: (
+            MappedTool(
+                component_id="select_columns",
+                asset_name=_asset_name_for(node),
+                attributes={
+                    "upstream_asset_key": _single_upstream(upstreams),
+                    "group_name": "alteryx_imported",
+                },
+                notes=[
+                    f"Portfolio Composer Text on tool {node.tool_id}: emitted as "
+                    "passthrough — headline-text report sections have no "
+                    "Dagster-native equivalent. Re-attach text content "
+                    "to the terminal pdf_report's html_template."
+                ],
+            )
+            if upstreams else
+            MappedTool(
+                component_id="inline_dataframe",
+                asset_name=_asset_name_for(node),
+                attributes={
+                    "columns": ["text"],
+                    "rows": [["placeholder"]],
+                    "group_name": "alteryx_imported",
+                },
+                notes=[
+                    f"Portfolio Composer Text on tool {node.tool_id}: no upstream — "
+                    "emitted as a 1-row inline_dataframe placeholder so the "
+                    "graph still materializes. Re-attach text content downstream."
+                ],
+            )
         )
     ),
     "AlteryxBasePluginsGui.DynamicRename.DynamicRename": (
@@ -3331,7 +3598,7 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
         # distance_calculator wants lat/lng pairs, not geometry columns — so
         # we synthesize geometry.x / geometry.y assumption (Alteryx geometries
         # commonly come from Create Points where x=lng, y=lat).
-        lambda node, upstreams: (lambda src_el, dst_el: MappedTool(
+        lambda node, upstreams: (lambda src_el, dst_el, unit_el, metric_el: MappedTool(
             component_id="distance_calculator",
             asset_name=_asset_name_for(node),
             attributes={
@@ -3343,8 +3610,26 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
                 "lng1_column": ((src_el.text or "Origin") + "_x") if src_el is not None and src_el.text else "Origin_x",
                 "lat2_column": ((dst_el.text or "Destination") + "_y") if dst_el is not None and dst_el.text else "Destination_y",
                 "lng2_column": ((dst_el.text or "Destination") + "_x") if dst_el is not None and dst_el.text else "Destination_x",
-                "output_column": "distance_miles",
-                "unit": "miles",
+                # Alteryx Distance tool emits the distance column as `DistanceMiles`
+                # or `DistanceKilometers` based on <OutputUnits> / <IsMetric>.
+                # Match that naming so downstream Formula / Filter / Summarize
+                # references resolve without manual rewiring.
+                "output_column": (
+                    "DistanceKilometers"
+                    if (
+                        (unit_el is not None and (unit_el.text or "").strip().lower() in ("kilometers", "km"))
+                        or (metric_el is not None and (metric_el.attrib.get("value", "False").lower() == "true"))
+                    )
+                    else "DistanceMiles"
+                ),
+                "unit": (
+                    "km"
+                    if (
+                        (unit_el is not None and (unit_el.text or "").strip().lower() in ("kilometers", "km"))
+                        or (metric_el is not None and (metric_el.attrib.get("value", "False").lower() == "true"))
+                    )
+                    else "miles"
+                ),
                 "group_name": "alteryx_imported",
             },
             notes=[
@@ -3356,7 +3641,12 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
                 "lat1_column / lng1_column / lat2_column / lng2_column attrs "
                 "in defs.yaml with your data's real lat/lng column names."
             ],
-        ))(node.config.find("SpatialObjSource"), node.config.find("SpatialObjDest"))
+        ))(
+            node.config.find("SpatialObjSource"),
+            node.config.find("SpatialObjDest"),
+            node.config.find("OutputUnits"),
+            node.config.find("IsMetric"),
+        )
     ),
     "AlteryxSpatialPluginsGui.FindNearest.FindNearest": (
         # FindNearest: find K nearest points in target set per source point.

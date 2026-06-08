@@ -105,6 +105,7 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     # Predictive — statsmodels-backed (with res.save() / sm.load() support)
     "count_regression": "CountRegressionComponent",
     "gamma_regression": "GammaRegressionComponent",
+    "weighted_average": "WeightedAverageComponent",
 }
 
 

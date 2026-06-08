@@ -377,10 +377,23 @@ def {ph_name}() -> pd.DataFrame:
             continue
 
         # Resolve upstreams in connection-anchor order so e.g. Join's Left/Right
-        # arrive deterministically.
+        # arrive deterministically. Special-case Union-style `#N` anchors:
+        # the plain `Input` anchor is anchor #1 (first input), then `#2`, `#3`,
+        # etc. follow numerically. Default-key alphabetical sort would put
+        # `Input` AFTER `#2`/`#3`/`#4` — wrong order for multi-input unions.
+        def _anchor_sort_key(e):
+            a = e.dest_anchor
+            if a == "Input":
+                return (0, 0, "")  # primary anchor first
+            if a.startswith("#"):
+                try:
+                    return (0, int(a[1:]), "")
+                except ValueError:
+                    pass
+            return (1, 0, a)  # everything else: alpha-sorted in third slot
         incoming_edges = sorted(
             wf.upstreams_of(node.tool_id),
-            key=lambda e: (e.dest_anchor, e.origin_tool),
+            key=lambda e: (_anchor_sort_key(e), e.origin_tool),
         )
         upstreams: List[str] = []
         for e in incoming_edges:

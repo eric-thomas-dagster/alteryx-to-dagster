@@ -88,6 +88,32 @@ def translate(alteryx_expr: str) -> ExprTranslation:
     # that isn't part of `==`, `<=`, `>=`, `!=` to `==`.
     expr = _convert_alteryx_equality(expr)
 
+    # Pre-pass: Alteryx `[Field] IN (v1, v2, ...)` → pandas `.isin([v1, v2, ...])`.
+    # We emit it in a one-step Python form (df["Field"].isin([...])) because the
+    # downstream bracket-conversion passes don't know about `isin` and would
+    # mangle the rewrite if we passed bracket-form through. When this pattern
+    # IS the whole expression, short-circuit to a Python translation; otherwise
+    # let the rewriter run only at the leaves where it's safe.
+    _in_pattern = re.compile(r'^\s*\[([^\]]+)\]\s+IN\s*\(\s*(.*?)\s*\)\s*$', re.DOTALL | re.IGNORECASE)
+    _in_match = _in_pattern.match(expr)
+    if _in_match:
+        _field = _in_match.group(1)
+        _values = _in_match.group(2)
+        # Translate any `[OtherField]` references inside the values list →
+        # `df["OtherField"]`. Without this, eval blows up on bare brackets.
+        # Skip the field name we already extracted (still `[Field]` literal).
+        _values_py = re.sub(
+            r"\[([^\]\[]+)\]",
+            lambda m: f'df["{m.group(1)}"]',
+            _values,
+        )
+        return ExprTranslation(
+            pandas_expr=f'df["{_field}"].isin([{_values_py}])',
+            is_python=True,
+            fully=True,
+            notes=[],
+        )
+
     # Pre-pass: rewrite Alteryx's `IF cond THEN a ELSEIF cond2 THEN b ELSE c ENDIF`
     # multi-arm conditional to nested IIF() calls so the function translator
     # picks them up. Handles ELSEIF chains by recursively wrapping.
@@ -294,6 +320,11 @@ _OPERATOR_REPLACEMENTS = [
     (re.compile(r"\bAND\b", re.IGNORECASE), "&"),
     (re.compile(r"\bOR\b", re.IGNORECASE), "|"),
     (re.compile(r"\bNOT\b", re.IGNORECASE), "~"),
+    # `&&` and `||` (some Alteryx flavors / pre-translated input) → pandas
+    # bitwise ops. Run BEFORE the bare `!` replacement so `!!` (rare) isn't
+    # consumed by mistake. Single ampersand / pipe stays as-is.
+    (re.compile(r"&&"), "&"),
+    (re.compile(r"\|\|"), "|"),
     # Alteryx `!` prefix (boolean NOT) → pandas `~` (Series NOT). Must NOT
     # touch `!=` (not-equal). Lookahead asserts the next char is not `=`.
     (re.compile(r"!(?!=)"), "~"),
@@ -439,10 +470,16 @@ def _paren_wrap_bool_operands(expr: str) -> str:
             i += 1
             continue
         if depth == 0 and ch in ("&", "|"):
-            # Skip "&&" / "||" — already paren'd or compound ops, leave alone.
+            # Skip "&&" / "||" — leave the doubled-operator pair alone (it
+            # may be already-paren'd compound logic from a previous pass).
+            # Append BOTH chars and advance by 2; otherwise the next-loop
+            # iteration sees the second pipe as a fresh top-level split,
+            # and emits `... | | ...` which downstream eval reads as
+            # `... or or ...` — a SyntaxError.
             if i + 1 < len(expr) and expr[i + 1] == ch:
                 buf.append(ch)
-                i += 1
+                buf.append(ch)
+                i += 2
                 continue
             parts.append("".join(buf).strip())
             ops.append(ch)
@@ -529,6 +566,12 @@ def _translate_expr(expr: str) -> Tuple[str, bool, List[str]]:
     notes: List[str] = []
     fully = True
 
+    # 0. Strip C-style `/* ... */` comments — Alteryx allows these inside
+    # expressions (often used to annotate formula branches), but Python
+    # eval treats `/` as division and chokes on the `*`. Drop them entirely.
+    import re as _re_strip
+    expr = _re_strip.sub(r"/\*.*?\*/", "", expr, flags=_re_strip.DOTALL)
+
     # 1. Apply operator replacements outside strings.
     expr = _apply_operator_replacements(expr)
 
@@ -586,6 +629,22 @@ def _translate_expr(expr: str) -> Tuple[str, bool, List[str]]:
 
     # 3. Wrap any leftover [Field] refs as df["Field"] (PYTHON path).
     expr = _wrap_brackets_for_python(expr)
+
+    # 3.5. Translate Alteryx `<lhs> IN(a, b, c)` to `<lhs>.isin([a, b, c])`.
+    # IN is an *infix* operator in Alteryx — `_find_next_alteryx_call` only
+    # detects prefix-positioned `FUNC(args)` calls, so IN slips through with
+    # the LHS untouched. We translate post-bracket-wrap so the LHS is already
+    # in `df["X"]` form. Repeat until no more matches (handles nested IN()).
+    import re as _re
+    _in_re = _re.compile(
+        r'(df\["[^"]+"\](?:\.[a-z_][a-z_0-9]*(?:\([^)]*\))?)*'
+        r'|[A-Za-z_][A-Za-z_0-9]*'
+        r')\s+IN\s*\(([^()]*)\)'
+    )
+    _prev = None
+    while _prev != expr:
+        _prev = expr
+        expr = _in_re.sub(lambda m: f"({m.group(1)}).isin([{m.group(2)}])", expr)
 
     # 4. Substitute the placeholders back. Do this AFTER bracket-wrapping
     #    so the wrap pass doesn't touch the pre-translated `df["x"]` /
@@ -699,16 +758,21 @@ def _t_contains(args: List[str]):
     if len(args) < 2:
         return f"Contains({', '.join(args)})", True, []
     s, sub = args[0], args[1]
+    # `.str.contains` raises AttributeError on non-string Series — and Alteryx's
+    # Contains() accepts any field type (it stringifies under the hood). Wrap
+    # every column reference in `.astype(str)` so int/bool/object dtypes don't
+    # break the runtime. The repeated wrap on already-string cols is cheap.
+    s_str = f"({s}).astype(str)"
     case_sensitive = "True" if len(args) < 3 else args[2]
     if case_sensitive == "1" or case_sensitive == "True":
-        return f"{s}.str.contains({sub}, regex=False)", True, []
-    return f"{s}.str.contains({sub}, regex=False, case=False)", True, []
+        return f"{s_str}.str.contains({sub}, regex=False)", True, []
+    return f"{s_str}.str.contains({sub}, regex=False, case=False)", True, []
 
 
 @register("StartsWith")
 def _t_startswith(args: List[str]):
     s, sub = args[0], args[1]
-    return f"{s}.str.startswith({sub})", True, []
+    return f"({s}).astype(str).str.startswith({sub})", True, []
 
 
 @register("EndsWith")
@@ -938,19 +1002,29 @@ def _t_dt_diff(args: List[str]):
     a, b, unit_raw = args[0], args[1], args[2]
     unit = _normalize_unit(unit_raw)
     if unit is None:
-        return f"DateTimeDiff({', '.join(args)})", False, [
-            f"DateTimeDiff: unknown unit {unit_raw!r}; left as-is."
+        # Fall back to days delta — guarantees the expression evaluates rather
+        # than raising NameError on the literal "DateTimeDiff" token.
+        return f"((pd.to_datetime({a}) - pd.to_datetime({b})).dt.days)", True, [
+            f"DateTimeDiff: unknown unit {unit_raw!r}; defaulted to days."
         ]
     if unit == "days":
-        return f"(({a}) - ({b})).dt.days", True, []
+        return f"((pd.to_datetime({a}) - pd.to_datetime({b})).dt.days)", True, []
     if unit == "hours":
-        return f"(({a}) - ({b})).dt.total_seconds() / 3600", True, []
+        return f"((pd.to_datetime({a}) - pd.to_datetime({b})).dt.total_seconds() / 3600)", True, []
     if unit == "minutes":
-        return f"(({a}) - ({b})).dt.total_seconds() / 60", True, []
+        return f"((pd.to_datetime({a}) - pd.to_datetime({b})).dt.total_seconds() / 60)", True, []
     if unit == "seconds":
-        return f"(({a}) - ({b})).dt.total_seconds()", True, []
-    return f"DateTimeDiff({', '.join(args)})", False, [
-        f"DateTimeDiff unit {unit!r} not implemented for now; left as-is."
+        return f"((pd.to_datetime({a}) - pd.to_datetime({b})).dt.total_seconds())", True, []
+    if unit in ("years", "months"):
+        # Pandas date-arithmetic doesn't have a simple .dt.years; approximate
+        # via days / period multipliers.
+        _divisor = 365.25 if unit == "years" else 30.4375
+        return (
+            f"((pd.to_datetime({a}) - pd.to_datetime({b})).dt.days / {_divisor})",
+            True, [f"DateTimeDiff: {unit} approximated as days/{_divisor}."],
+        )
+    return f"((pd.to_datetime({a}) - pd.to_datetime({b})).dt.days)", True, [
+        f"DateTimeDiff unit {unit!r} not implemented; defaulted to days."
     ]
 
 
@@ -1144,3 +1218,81 @@ def _t_coalesce(args: List[str]):
     for a in reversed(args[:-1]):
         expr = f"({a}).fillna({expr})"
     return expr, True, []
+
+
+@register("EscapeXMLMetacharacters")
+def _t_escape_xml(args: List[str]):
+    """Alteryx EscapeXMLMetacharacters(s) → XML-escape &, <, >, ', "."""
+    s = args[0]
+    return (
+        f'({s}).astype(str)'
+        f'.str.replace("&", "&amp;", regex=False)'
+        f'.str.replace("<", "&lt;", regex=False)'
+        f'.str.replace(">", "&gt;", regex=False)'
+        f'.str.replace("\\"", "&quot;", regex=False)'
+        f"""
+        .str.replace("'", "&apos;", regex=False)
+        """,
+        True,
+        [],
+    )
+
+
+@register("UnescapeXMLMetacharacters")
+def _t_unescape_xml(args: List[str]):
+    s = args[0]
+    return (
+        f'({s}).astype(str)'
+        f'.str.replace("&amp;", "&", regex=False)'
+        f'.str.replace("&lt;", "<", regex=False)'
+        f'.str.replace("&gt;", ">", regex=False)'
+        f'.str.replace("&quot;", "\\"", regex=False)'
+        f".str.replace(\"&apos;\", \"'\", regex=False)",
+        True,
+        [],
+    )
+
+
+@register("HexToNumber")
+def _t_hex_to_number(args: List[str]):
+    s = args[0]
+    return f"({s}).astype(str).apply(lambda _v: int(_v, 16) if _v else 0)", True, []
+
+
+@register("NumberToHex")
+def _t_number_to_hex(args: List[str]):
+    n = args[0]
+    return f"({n}).astype(int).apply(lambda _v: format(_v, 'x'))", True, []
+
+
+@register("UrlEncode")
+def _t_url_encode(args: List[str]):
+    s = args[0]
+    return f"({s}).astype(str).apply(lambda _v: __import__('urllib.parse', fromlist=['quote']).quote(_v))", True, []
+
+
+@register("UrlDecode")
+def _t_url_decode(args: List[str]):
+    s = args[0]
+    return f"({s}).astype(str).apply(lambda _v: __import__('urllib.parse', fromlist=['unquote']).unquote(_v))", True, []
+
+
+@register("MD5_ASCII")
+@register("MD5_Hex")
+@register("MD5_UNICODE")
+@register("MD5")
+def _t_md5(args: List[str]):
+    s = args[0]
+    return f"({s}).astype(str).apply(lambda _v: __import__('hashlib').md5(_v.encode()).hexdigest())", True, []
+
+
+@register("SHA1")
+def _t_sha1(args: List[str]):
+    s = args[0]
+    return f"({s}).astype(str).apply(lambda _v: __import__('hashlib').sha1(_v.encode()).hexdigest())", True, []
+
+
+@register("SHA256")
+def _t_sha256(args: List[str]):
+    s = args[0]
+    return f"({s}).astype(str).apply(lambda _v: __import__('hashlib').sha256(_v.encode()).hexdigest())", True, []
