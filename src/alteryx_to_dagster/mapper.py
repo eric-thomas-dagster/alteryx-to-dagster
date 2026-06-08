@@ -1481,14 +1481,33 @@ def {asset_name}(upstream: pd.DataFrame) -> pd.DataFrame:
 
 
 def _map_json_parse(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
-    """Alteryx JSON Parse → `json_flatten` registry component."""
+    """Alteryx JSON Parse → `json_flatten` registry component.
+
+    Alteryx's JSONParse emits LONG-format output: one row per (key-path,
+    value) pair with `JSON_Name` + `JSON_ValueString` columns. The
+    json_flatten component's `output_format=long` matches that shape so
+    downstream tools that filter on `JSON_Name` resolve.
+    """
+    cfg = node.config
+    # Alteryx XML uses <JSON_Field> (Designer 2018+) — fall back to <Field>
+    # for older / hand-written variants. Empty-element trick: ElementTree's
+    # Element.__bool__ is False when there are no children, so `or` would
+    # silently fall through on text-only elements. Use `is not None`.
+    field_el = cfg.find("JSON_Field")
+    if field_el is None:
+        field_el = cfg.find("Field")
+    src_col = (field_el.text or "").strip() if field_el is not None and field_el.text else None
+    attrs: Dict[str, object] = {
+        "upstream_asset_key": _single_upstream(upstreams),
+        "output_format": "long",
+        "group_name": "alteryx_imported",
+    }
+    if src_col:
+        attrs["column"] = src_col
     return MappedTool(
         component_id="json_flatten",
         asset_name=_asset_name_for(node),
-        attributes={
-            "upstream_asset_key": _single_upstream(upstreams),
-            "group_name": "alteryx_imported",
-        },
+        attributes=attrs,
     )
 
 
