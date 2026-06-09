@@ -11,7 +11,7 @@ in the project. The runner takes care of running those adds.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import yaml
 
@@ -192,6 +192,7 @@ def emit_migration_report(
     yxmd_source: str,
     mapped: List[tuple],   # list of (tool_id, plugin_short, component_id, asset_name, notes)
     unmapped: List[tuple], # list of (tool_id, plugin, reason, suggestion)
+    batch_macros: Optional[List[Dict[str, object]]] = None,  # batch-iteration semantics detected
 ) -> Path:
     """Write MIGRATION.md summarizing what was converted and what wasn't.
 
@@ -374,6 +375,64 @@ def emit_migration_report(
         ]
         for tool_id, plugin, reason, suggestion in real_unmapped_for_table:
             lines.append(f"| {tool_id} | `{plugin}` | {reason} | {suggestion} |")
+
+    # Batch macros — the macro RUNS ONCE PER ROW (or per group) of the
+    # Control input. Our splicer flattens this to a single pass; the
+    # iteration semantic is lost. Surface each detected batch macro with
+    # the specific binding so the user can pick the right Dagster primitive.
+    if batch_macros:
+        lines += [
+            "",
+            "## Batch Macros (lost iteration semantics)",
+            "",
+            "Your source workflow has batch macro reference(s) — macros that "
+            "Alteryx runs ONCE PER ROW (or per group) of a Control input. The "
+            "importer splices each macro's tools INLINE one time (with whatever "
+            "value the macro's internal config baked in), which is wrong for "
+            "this iteration pattern.",
+            "",
+            "**Why we don't auto-wire**: there's no single right answer. The "
+            "best Dagster primitive depends on YOUR data shape and observability "
+            "needs:",
+            "",
+            "- **`StaticPartitionsDefinition`** — when the iteration values are "
+            "known ahead of time and stable, and you want each iteration as a "
+            "separately materializable, separately observable asset partition. "
+            "Backfills + targeted re-materialization come for free.",
+            "- **`DynamicPartitionsDefinition`** — same shape but the values "
+            "arrive at runtime (e.g. read from an upstream asset). You register "
+            "partition keys before launching; each iteration is still its own "
+            "partition with separate metadata.",
+            "- **`DynamicOut` / `DynamicOutput`** — graph-time fan-out within a "
+            "single op. Useful when iterations don't need per-iteration "
+            "persistence and you want them all in one run. See "
+            "https://docs.dagster.io/api/dagster/dynamic",
+            "- **In-asset Python loop** — the simplest option when each "
+            "iteration is small / cheap and you don't need per-iteration "
+            "observability. Just `for v in control_values: ...` inside the "
+            "downstream asset's compute, return the unioned DataFrame.",
+            "",
+            "**What we did**: spliced each batch macro inline (one pass) so "
+            "the asset graph topology is correct. The chain runs with the "
+            "first iteration's value(s) only. Restore the iteration by "
+            "rewriting the downstream consumer(s) to use one of the patterns "
+            "above.",
+            "",
+            "| Tool ID | Macro | Iteration param | Control field | Values observed |",
+            "|---|---|---|---|---|",
+        ]
+        for bm in batch_macros:
+            _tid = bm.get("parent_tool_id", "")
+            _name = bm.get("macro_name", "")
+            _cp = bm.get("control_params", "") or "(per-row)"
+            _cf = bm.get("control_field", "") or "—"
+            _vals = bm.get("control_values", []) or []
+            _vals_str = (", ".join(f"`{v}`" for v in _vals[:8])
+                         + (f" (+{len(_vals)-8} more)" if len(_vals) > 8 else "")
+                         if _vals else "_unknown — Control input wasn't an inline table_")
+            lines.append(
+                f"| {_tid} | `{_name}` | `{_cp.replace(chr(10), ' ')}` | {_cf} | {_vals_str} |"
+            )
 
     lines += [
         "",

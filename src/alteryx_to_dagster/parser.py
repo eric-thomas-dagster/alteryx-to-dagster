@@ -35,7 +35,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -95,6 +95,20 @@ class AlteryxWorkflow:
     # uses this to resolve relative .yxmc references — Alteryx workflows
     # typically reference user macros sitting next to the .yxmd.
     source_dir: Optional[Path] = None
+    # Batch macro references detected during splicing. Each entry:
+    #   {
+    #     "parent_tool_id": str,         # the macro-call node's ToolID
+    #     "macro_name": str,             # display name (basename of .yxmc)
+    #     "batch_group_by": str,         # the GroupBy field (empty = per-row)
+    #     "control_params": str,         # the raw "Control Param (N)=Field" mapping
+    #     "control_values": List[str],   # observed control values (extracted from
+    #                                    # the upstream control input if it's an
+    #                                    # inline_dataframe), or [] if unknown
+    #   }
+    # The macro is still spliced (one-pass), but the iteration semantic is
+    # surfaced in MIGRATION.md so the user can pick partitions / DynamicOut /
+    # in-asset loop — whatever fits their data shape.
+    batch_macros: List[Dict[str, Any]] = field(default_factory=list)
 
     def by_id(self) -> Dict[str, AlteryxNode]:
         return {n.tool_id: n for n in self.nodes}

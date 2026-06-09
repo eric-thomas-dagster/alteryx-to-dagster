@@ -520,6 +520,7 @@ def import_workflow(
         yxmd_source=str(yxmd_path),
         mapped=mapped_results,
         unmapped=unmapped_results,
+        batch_macros=getattr(wf, "batch_macros", []) or [],
     )
     files_written.append(report)
 

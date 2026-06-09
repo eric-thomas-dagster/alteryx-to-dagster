@@ -102,6 +102,59 @@ def splice_macros(
         except (ET.ParseError, OSError):
             continue
 
+        # Detect batch-macro iteration semantics. When a macro reference has
+        # a `<Value name="BatchMacroGroupBy">` (or non-empty ControlParams),
+        # the macro RUNS ONCE PER ROW (or per group) of the Control input.
+        # Our splicer flattens this to a single pass; the iteration is lost.
+        # Capture enough info to surface it in MIGRATION.md so the user can
+        # pick the right Dagster primitive (partitions, DynamicOut, in-asset
+        # loop) for their use case.
+        _batch_marker = parent_node.config.find(".//Value[@name='BatchMacroGroupBy']")
+        _control_params = parent_node.config.find(".//Value[@name='ControlParams']")
+        _control_text = (_control_params.text or "").strip() if _control_params is not None else ""
+        if _batch_marker is not None or _control_text:
+            # Trace the Control upstream to extract the iteration values if
+            # the source is an inline_dataframe (textinput).
+            _ctrl_values: List[str] = []
+            _ctrl_field: str = ""
+            # Parse the `Control Parameter (N)=Field` mapping to find the
+            # column name in the Control input.
+            import re as _re
+            _m = _re.search(r"=\s*(\S.*?)\s*$", _control_text, _re.MULTILINE)
+            if _m:
+                _ctrl_field = _m.group(1).strip()
+            # Find the Control upstream edge.
+            for _e in wf.edges:
+                if _e.dest_tool != parent_node.tool_id:
+                    continue
+                if _e.dest_anchor not in ("Control", "ControlParam", "ControlInput"):
+                    continue
+                _src_node = next((n for n in wf.nodes if n.tool_id == _e.origin_tool), None)
+                if _src_node is None:
+                    continue
+                if "TextInput" not in _src_node.plugin:
+                    break
+                # Extract the column's values from the textinput XML.
+                _fields = [
+                    f.attrib.get("name", "") for f in _src_node.config.findall(".//Field")
+                ]
+                _idx = _fields.index(_ctrl_field) if _ctrl_field in _fields else 0
+                for _r in _src_node.config.findall(".//Data/r"):
+                    _cells = _r.findall("c")
+                    if _idx < len(_cells):
+                        _val = (_cells[_idx].text or "").strip()
+                        if _val:
+                            _ctrl_values.append(_val)
+                break
+            wf.batch_macros.append({
+                "parent_tool_id": parent_node.tool_id,
+                "macro_name": macro_path.name,
+                "batch_group_by": (_batch_marker.text or "").strip() if (_batch_marker is not None and _batch_marker.text) else "",
+                "control_params": _control_text,
+                "control_field": _ctrl_field,
+                "control_values": _ctrl_values,
+            })
+
         # Recurse so child's nested macros expand too.
         child_wf = splice_macros(
             child_wf,
@@ -214,6 +267,7 @@ def splice_macros(
         bundled_data_files=wf.bundled_data_files,
         bundled_macros=wf.bundled_macros,
         source_dir=getattr(wf, "source_dir", None),
+        batch_macros=wf.batch_macros,
     )
 
 
