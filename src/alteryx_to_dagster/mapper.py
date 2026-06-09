@@ -4013,15 +4013,66 @@ _CONTROL_FLOW_PLUGINS = {
         "No data flow; drop and wire equivalent config."
     ),
     "AlteryxGuiToolkit.Questions.NumericUpDown.NumericUpDown": (
-        "NumericUpDown — Alteryx App numeric input. Becomes a Dagster "
-        "config field or run-config var. Drop and wire equivalent config."
+        "NumericUpDown — Alteryx App numeric input. No data emitted. To "
+        "make the original chain's `df[\"Numeric Up Down Result\"]` reference "
+        "resolve, declare a Dagster `Config` field on the downstream filter / "
+        "formula asset and inject it via Run Config at launch. We do not "
+        "auto-wire this — see the Alteryx App Inputs section below."
+    ),
+    "AlteryxGuiToolkit.Questions.DropDownListBox.DropDown": (
+        "Drop Down (List Box) — Alteryx App dropdown input. No data emitted. "
+        "Declare a Dagster `Config` field on the downstream filter / formula "
+        "and inject the selected value via Run Config. We do not auto-wire."
+    ),
+    "AlteryxGuiToolkit.Questions.DropDownListBox.ListBox": (
+        "List Box — Alteryx App multi-select input. No data emitted. "
+        "Declare a Dagster `Config` field on the downstream asset and "
+        "inject the selected list via Run Config. We do not auto-wire."
+    ),
+    "AlteryxGuiToolkit.Questions.TextBox.TextBox": (
+        "Text Box (input) — Alteryx App free-text input. No data emitted. "
+        "Declare a Dagster `Config` field on the downstream asset and inject "
+        "the entered text via Run Config. We do not auto-wire."
+    ),
+    "AlteryxGuiToolkit.Questions.FileBrowse.FileBrowse": (
+        "File Browse — Alteryx App file-picker input. No data emitted. "
+        "Declare a Dagster `Config` field for the file path and reference it "
+        "from downstream input assets. We do not auto-wire."
+    ),
+    "AlteryxGuiToolkit.Questions.FolderBrowse.FolderBrowse": (
+        "Folder Browse — Alteryx App folder-picker input. No data emitted. "
+        "Declare a Dagster `Config` field for the folder path and reference "
+        "it from downstream input assets. We do not auto-wire."
+    ),
+    "AlteryxGuiToolkit.Questions.DateInput.DateInput": (
+        "Date Input — Alteryx App date picker. No data emitted. Declare a "
+        "Dagster `Config` (or use a TimeWindowPartition for backfills) and "
+        "inject the date value at run launch. We do not auto-wire."
+    ),
+    "AlteryxGuiToolkit.Questions.DateTimeInput.DateTimeInput": (
+        "DateTime Input — Alteryx App date+time picker. No data emitted. "
+        "Declare a Dagster `Config` field and inject at run launch. We do not auto-wire."
+    ),
+    "AlteryxGuiToolkit.Questions.RadioGroup.RadioGroup": (
+        "Radio Group — Alteryx App single-choice input. No data emitted. "
+        "Declare a Dagster `Config` field with the available choices and "
+        "inject at run launch. We do not auto-wire."
+    ),
+    "AlteryxGuiToolkit.Questions.ColorPicker.ColorPicker": (
+        "Color Picker — Alteryx App color-selection input. No data emitted. "
+        "Declare a Dagster `Config` field if the downstream needs the value."
+    ),
+    "AlteryxGuiToolkit.Questions.MapInput.MapInput": (
+        "Map Input — Alteryx App spatial-input. No data emitted. Declare a "
+        "Dagster `Config` field with the chosen geometry (WKT / GeoJSON) and "
+        "inject at run launch. We do not auto-wire."
     ),
     "AlteryxGuiToolkit.Questions.Label.Label": (
         "Label — annotation only inside an Alteryx App. No data flow; drop."
     ),
     "AlteryxGuiToolkit.Questions.ControlParam.ControlParam": (
         "Control Parameter — Alteryx App input used by Macros. No data flow; "
-        "becomes a Dagster config field at the macro boundary. Drop."
+        "becomes a Dagster `Config` field at the macro boundary. We do not auto-wire."
     ),
     "AlteryxBasePluginsGui.MacroOutput.MacroOutput": (
         "Macro Output — marks the output anchor of a custom .yxmc. The macro "

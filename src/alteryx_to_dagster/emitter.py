@@ -302,7 +302,69 @@ def emit_migration_report(
         for tool_id, plugin, asset_name, note in note_rows:
             lines.append(f"- **tool {tool_id}** (`{plugin}`, asset `{asset_name}`): {note}")
 
-    if unmapped:
+    # App Question (interactive input) tools: list them separately with
+    # explicit Dagster Config guidance. We intentionally do NOT auto-wire
+    # interactive inputs — they become Dagster `Config` fields that you
+    # declare on the consuming asset and override at run launch.
+    app_input_rows = [
+        (tid, plugin) for (tid, plugin, _reason, _suggestion) in unmapped
+        if "AlteryxGuiToolkit.Questions." in plugin
+        or plugin == "AlteryxGuiToolkit.Action.Action"
+    ]
+    if app_input_rows:
+        lines += [
+            "",
+            "## Alteryx App Inputs (interactive runtime parameters)",
+            "",
+            "Your source workflow contains Alteryx App question / action tools "
+            "that bind runtime parameters (dropdowns, numeric inputs, text fields, "
+            "file pickers, etc.). The importer does NOT auto-wire these — "
+            "their semantics are deeply tied to the App runtime, and turning them "
+            "into synthetic data assets is an anti-pattern in Dagster.",
+            "",
+            "**What we do:** skip emitting an asset.",
+            "",
+            "**What you do:** for each input value the downstream chain "
+            "references (e.g. `df[\"Drop Down Result\"]`, `df[\"Numeric Up Down "
+            "Result\"]`), declare a Dagster `Config` field on the consuming "
+            "asset / op and inject the value at run launch:",
+            "",
+            "```python",
+            "from dagster import Config",
+            "",
+            "class FilterCfg(Config):",
+            "    threshold: int = 50",
+            "    region: str = \"North\"",
+            "",
+            "@asset",
+            "def my_filter(context, upstream, config: FilterCfg):",
+            "    return upstream[upstream['x'] <= config.threshold]",
+            "```",
+            "",
+            "Override at launch:",
+            "",
+            "```bash",
+            "dg launch --assets my_filter \\",
+            "    --config '{\"ops\": {\"my_filter\": {\"config\": "
+            "{\"threshold\": 100, \"region\": \"South\"}}}}'",
+            "```",
+            "",
+            "See https://docs.dagster.io/concepts/configuration/config-schema "
+            "for the full Config schema reference.",
+            "",
+            "| Tool ID | Alteryx plugin | Replace `df[\"<col>\"]` lookups with `config.<field>` |",
+            "|---|---|---|",
+        ]
+        for tool_id, plugin in app_input_rows:
+            lines.append(f"| {tool_id} | `{plugin}` | declare a Dagster `Config` field, inject at run launch |")
+
+    # Truly unmapped tools (need a real mapper, not interactive-input semantics)
+    real_unmapped_for_table = [
+        e for e in unmapped
+        if not ("AlteryxGuiToolkit.Questions." in e[1]
+                or e[1] == "AlteryxGuiToolkit.Action.Action")
+    ]
+    if real_unmapped_for_table:
         lines += [
             "",
             "## Unmapped tools — manual conversion required",
@@ -310,7 +372,7 @@ def emit_migration_report(
             "| Tool ID | Alteryx plugin | Why | Suggestion |",
             "|---|---|---|---|",
         ]
-        for tool_id, plugin, reason, suggestion in unmapped:
+        for tool_id, plugin, reason, suggestion in real_unmapped_for_table:
             lines.append(f"| {tool_id} | `{plugin}` | {reason} | {suggestion} |")
 
     lines += [
