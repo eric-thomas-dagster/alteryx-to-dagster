@@ -1511,6 +1511,120 @@ def _map_json_parse(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     )
 
 
+def _map_jupyter_code(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx JupyterCode tool → `jupyter_notebook` (backend='exec').
+
+    The notebook source is stored as a JSON `.ipynb` payload inside the
+    `<Notebook>` CDATA of the tool's Configuration. We concatenate every
+    `code` cell into a single inline Python block and rewrite Alteryx-only
+    calls so the code runs against the upstream DataFrame:
+
+      - `Alteryx.read("#1")` / `Alteryx.read(1)` → `df` (the upstream)
+      - `Alteryx.read("#N")` (N > 1) → kept as-is (multi-input not modeled
+        in a single-asset Dagster output; user wires manually)
+      - `Alteryx.write(<expr>, N)` → `out_df = <expr>` for the LAST write
+        call (which one matters depends on the downstream chain; we surface
+        all writes in MIGRATION.md so the user can split into multi_asset
+        if needed)
+
+    Multi-output JupyterCode tools (with multiple `Alteryx.write(_, N)` calls
+    going to separate downstream chains) collapse to a single asset that
+    emits the LAST write target — surface remaining outputs in MIGRATION.md.
+    """
+    nb_el = node.config.find("Notebook")
+    code: str = ""
+    output_count = 0
+    extracted = False
+    if nb_el is not None and nb_el.text:
+        import json as _json
+        import re as _re
+        try:
+            nb = _json.loads(nb_el.text)
+            cells = nb.get("cells", [])
+            code_lines: List[str] = []
+            last_write_expr: Optional[str] = None
+            seen_writes: List[tuple] = []  # (expr, anchor)
+            for cell in cells:
+                if cell.get("cell_type") != "code":
+                    continue
+                src = cell.get("source", [])
+                if isinstance(src, list):
+                    src = "".join(src)
+                # Rewrite Alteryx.read("#N") / Alteryx.read(N) → df (input 1)
+                # OR keep N>1 as a placeholder.
+                def _read_repl(m):
+                    n = m.group(1).strip().strip('"').strip("'").lstrip("#")
+                    return "df" if n in ("", "1") else f'df  # Alteryx.read("#{n}") — multi-input, wire manually'
+                src = _re.sub(r"Alteryx\.read\(\s*([^)]+?)\s*\)", _read_repl, src)
+                # Capture Alteryx.write(expr, N) calls; keep them as comments
+                # and assign the LAST one to out_df.
+                def _write_repl(m):
+                    nonlocal last_write_expr, output_count
+                    expr = m.group(1).strip()
+                    anchor = m.group(2).strip()
+                    seen_writes.append((expr, anchor))
+                    last_write_expr = expr
+                    output_count += 1
+                    return f"# Alteryx.write({expr}, {anchor})  — output anchor #{anchor}"
+                src = _re.sub(
+                    r"Alteryx\.write\(\s*([^,]+?)\s*,\s*(\d+)\s*\)", _write_repl, src
+                )
+                # Drop pip-install boilerplate the Alteryx Jupyter wrapper adds.
+                src = _re.sub(r"from ayx import Package\s*\n?", "", src)
+                src = _re.sub(r"from ayx import Alteryx\s*\n?", "", src)
+                src = _re.sub(r"Package\.installPackages\([^)]*\)\s*\n?", "", src)
+                if src.strip():
+                    code_lines.append(src.rstrip())
+            if last_write_expr:
+                code_lines.append(f"out_df = {last_write_expr}")
+                extracted = True
+            code = "\n".join(code_lines).strip()
+        except Exception:
+            code = ""
+
+    if not extracted:
+        # Older variants: <Code> or <Script> contained inline Python directly.
+        for tag in ("Code", "Script", "NotebookSource"):
+            _el = node.config.find(tag)
+            if _el is not None and _el.text:
+                code = _el.text.strip()
+                extracted = True
+                break
+    if not code:
+        code = "out_df = df  # original JupyterCode body not captured"
+
+    _notes = []
+    if output_count > 1:
+        _notes.append(
+            f"JupyterCode on tool {node.tool_id}: notebook has {output_count} "
+            f"separate `Alteryx.write(_, N)` outputs. This asset emits the LAST "
+            f"one ({last_write_expr}); the others are commented in the code. "
+            f"To restore Alteryx's multi-output topology, split this asset into "
+            f"a Dagster @multi_asset (one output per `Alteryx.write(_, N)`)."
+        )
+    elif output_count == 1:
+        _notes.append(
+            f"JupyterCode on tool {node.tool_id}: notebook body extracted "
+            f"from `<Notebook>` JSON ({output_count} output)."
+        )
+    else:
+        _notes.append(
+            f"JupyterCode on tool {node.tool_id}: couldn't extract notebook "
+            f"body — placeholder `out_df = df` in place. Fill in manually."
+        )
+    return MappedTool(
+        component_id="jupyter_notebook",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "backend": "exec",
+            "code": code,
+            "group_name": "alteryx_imported",
+        },
+        notes=_notes,
+    )
+
+
 def _map_json_parse_DEPRECATED(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Old inline impl — NOT registered."""
     cfg = node.config
@@ -2765,8 +2879,25 @@ def _map_alteryx_macro(node: AlteryxNode, upstreams: List[str]):
         defaults.setdefault("upstream_asset_key", _single_upstream(upstreams))
         defaults.setdefault("group_name", "alteryx_imported")
         # Stock macros that need parent-Configuration-driven attributes:
-        # WeightedAvg.yxmc pulls value/weight/group cols and output name from
-        # the parent <Configuration><Value name=…> entries.
+        # SelectRecords.yxmc reads `<Value name="Ranges">3-21</Value>` for the
+        # 1-indexed row range. Map to sample(method='range', range_start, range_end).
+        # Default to head if Ranges isn't a simple `<start>-<end>` (e.g. `1+`
+        # which means "from row 1 to end" — keep all rows).
+        if component_id == "sample" and _bare.lower() == "selectrecords.yxmc":
+            cfg = node.config
+            _ranges = None
+            for _v in cfg.findall("Value"):
+                if _v.attrib.get("name") == "Ranges" and _v.text:
+                    _ranges = _v.text.strip()
+                    break
+            if _ranges:
+                import re as _re
+                _m = _re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", _ranges)
+                if _m:
+                    defaults.pop("sample_size", None)
+                    defaults["method"] = "range"
+                    defaults["range_start"] = int(_m.group(1))
+                    defaults["range_end"] = int(_m.group(2))
         if component_id == "weighted_average":
             cfg = node.config
             _val = _weight = _group = _out = None
@@ -3356,29 +3487,7 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
             notes=[f"R Tool on tool {node.tool_id}: ported to r_script (backend='rscript')."],
         ))(node.config.find("RCode") or node.config.find("Code") or node.config.find("Script"))
     ),
-    "JupyterCode": (
-        # JupyterCode → jupyter_notebook component (backend='exec' for inline body).
-        lambda node, upstreams: (lambda code_el: MappedTool(
-            component_id="jupyter_notebook",
-            asset_name=_asset_name_for(node),
-            attributes={
-                "upstream_asset_key": _single_upstream(upstreams),
-                "backend": "exec",
-                "code": (
-                    (code_el.text or "out_df = df").strip()
-                    if code_el is not None and code_el.text
-                    else "out_df = df  # original JupyterCode body not captured"
-                ),
-                "group_name": "alteryx_imported",
-            },
-            notes=[
-                f"JupyterCode on tool {node.tool_id}: original Python body ported "
-                "to jupyter_notebook component (backend='exec'). The code must "
-                "assign result to `out_df`. For real notebook execution, switch "
-                "backend='papermill' and supply notebook_path."
-            ],
-        ))(node.config.find("Code") or node.config.find("Script") or node.config.find("NotebookSource"))
-    ),
+    "JupyterCode": _map_jupyter_code,
     "AlteryxSpatialPluginsGui.SpatialProcess.SpatialProcess": (
         # SpatialProcess covers single-geom transforms. Alteryx <Method> values:
         #   CreateCentroid → centroid
