@@ -141,12 +141,31 @@ def splice_macros(
         parent_out_edges = [e for e in spliced_edges if e.origin_tool == parent_node.tool_id]
 
         # Wire parent-in → child's macro-input-downstreams.
-        # (For each MacroInput, find what it FEEDS in the child, then replace
-        # that with the parent's upstream.)
+        # Multi-anchor macros (batch macros with a Control anchor, or any
+        # macro with multiple Input anchors) need anchor-aware matching —
+        # otherwise the parent's Control edge gets cross-wired into the
+        # data MacroInput and downstream filters consume the wrong upstream.
+        # Match `parent_edge.dest_anchor` against the MacroInput's `<Name>`
+        # (the anchor name the macro author assigned). Fall back to the
+        # all-pairs cross-product when a MacroInput has no `<Name>` (older
+        # single-anchor macros).
+        def _macro_input_name(mi_node) -> str:
+            name_el = mi_node.config.find("Name")
+            return (name_el.text or "").strip() if name_el is not None and name_el.text else ""
         rewired_edges: List[AlteryxEdge] = []
         for mi in macro_inputs:
             mi_downstreams = [e for e in renumbered_edges if e.origin_tool == mi.tool_id]
-            for parent_in in parent_in_edges:
+            _mi_name = _macro_input_name(mi)
+            # Pick parent edges whose destination anchor matches this
+            # MacroInput's declared name. If none match (older single-anchor
+            # macros where the parent edge anchor is "Input" by default),
+            # fall back to all parent edges so we still wire SOMETHING.
+            _matched = [p for p in parent_in_edges if p.dest_anchor == _mi_name]
+            if not _matched and _mi_name:
+                _matched = [p for p in parent_in_edges if not p.dest_anchor or p.dest_anchor == "Input"]
+            if not _matched:
+                _matched = list(parent_in_edges)
+            for parent_in in _matched:
                 for mi_e in mi_downstreams:
                     rewired_edges.append(AlteryxEdge(
                         origin_tool=parent_in.origin_tool,

@@ -232,11 +232,21 @@ def _from_root(root: ET.Element) -> AlteryxWorkflow:
             dest = conn_el.find("Destination")
             if origin is None or dest is None:
                 continue
+            # Multi-input union / append connections carry order via the
+            # outer Connection's `name` attribute (`#2`, `#3`, `#4`, ...).
+            # The first input has NO name attribute. Promote that to the
+            # dest_anchor so downstream order-sensitive logic (union
+            # by-position, append by-anchor) sees the right ordering.
+            conn_name = conn_el.attrib.get("name", "")
+            _dest_anchor = dest.attrib.get("Connection", "Input")
+            if conn_name and _dest_anchor == "Input":
+                # First input keeps "Input", others become "#2", "#3", ...
+                _dest_anchor = conn_name
             wf.edges.append(AlteryxEdge(
                 origin_tool=origin.attrib.get("ToolID", ""),
                 origin_anchor=origin.attrib.get("Connection", "Output"),
                 dest_tool=dest.attrib.get("ToolID", ""),
-                dest_anchor=dest.attrib.get("Connection", "Input"),
+                dest_anchor=_dest_anchor,
             ))
 
     return wf
