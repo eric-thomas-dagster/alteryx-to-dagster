@@ -44,6 +44,41 @@ _FIELD_ELEMENT_RE = __import__("re").compile(
 )
 
 
+def _rewrite_controlparam_filter(
+    condition: str,
+    *,
+    field: str,
+    values: List[str],
+) -> str:
+    r"""Rewrite a batch-macro-internal Filter's condition from a hardcoded
+    ControlParam value to `context.partition_key`.
+
+    The Alteryx batch macro encodes its iteration filter with a hardcoded
+    operand (e.g. `df["Category"] == "Acceleration"`). At runtime the
+    Alteryx engine substitutes this operand with each iteration value via
+    an Action tool. We don't process Action tools, so we get the design-
+    time hardcoded value at import. When that value is one of the known
+    iteration values, swap it for `context.partition_key` so the
+    partitioned Dagster asset filters to the current partition slice.
+
+    Matches both pandas-eval and Python-eval forms:
+        df["X"] == "value"       (both quote styles)
+        df['X'] == 'value'
+        X == "value"             (bare field, pandas-eval shortcut)
+    """
+    import re as _re
+    _val_re = "|".join(_re.escape(v) for v in values if v)
+    if not _val_re:
+        return condition
+    # Match `<field-ref> == '<known-value>'` (or `==`/`= `, single/double
+    # quotes). The field-ref can be `df["X"]`, `df['X']`, or bare `X`.
+    pat = _re.compile(
+        rf"""(df\[\s*['"]\s*{_re.escape(field)}\s*['"]\s*\]|\b{_re.escape(field)}\b)"""
+        rf"""(\s*==\s*)(['"])\s*(?:{_val_re})\s*\3""",
+    )
+    return pat.sub(lambda m: f"{m.group(1)}{m.group(2)}context.partition_key", condition)
+
+
 def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> tuple:
     """Scan downstream tools of `origin_tool_id` and return:
 
@@ -446,6 +481,40 @@ def import_workflow(
 
         assert isinstance(result, MappedTool)
         tool_to_asset[node.tool_id] = result.asset_name
+
+        # Batch-macro: when this node was spliced from an Alteryx batch
+        # macro with known iteration values, add static-partition attrs
+        # and (for the ControlParam-substituted Filter) rewrite the
+        # hardcoded condition to read context.partition_key. Dagster
+        # then runs the macro chain once per partition value, and the
+        # unpartitioned downstream auto-unions via AllPartitionMapping.
+        if (
+            node.batch_macro_parent_id
+            and node.batch_macro_control_values
+            and result.component_id not in ("(inline_python)",)
+        ):
+            attrs = result.attributes
+            attrs.setdefault("partition_type", "static")
+            attrs.setdefault("partition_values", list(node.batch_macro_control_values))
+            # Filter substitution: if this filter's condition is
+            # `df['<control_field>'] == '<value>'` where value is in the
+            # control_values list, replace with context.partition_key.
+            if result.component_id == "filter" and node.batch_macro_control_field:
+                _cond = attrs.get("condition")
+                if isinstance(_cond, str):
+                    _new_cond = _rewrite_controlparam_filter(
+                        _cond,
+                        field=node.batch_macro_control_field,
+                        values=node.batch_macro_control_values,
+                    )
+                    if _new_cond != _cond:
+                        attrs["condition"] = _new_cond
+                        result.notes.append(
+                            f"Batch macro: filter condition rewired from "
+                            f"hardcoded `{_cond}` to `context.partition_key` "
+                            f"so it varies per-partition over "
+                            f"{node.batch_macro_control_values}."
+                        )
 
         if result.inline_python:
             path = emit_inline_python(out_dir, pkg, result.asset_name, result.inline_python)

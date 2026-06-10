@@ -46,6 +46,14 @@ class AlteryxNode:
     config: ET.Element         # raw <Configuration> element for the mapper
     position: Dict[str, float] # {"x": ..., "y": ...} — kept for layout debugging
     meta_info: Optional[ET.Element] = None  # <MetaInfo> sibling (output schema Alteryx saved)
+    # Batch-macro tracking — set by macro_splicer on renumbered nodes that
+    # came from inlining an Alteryx batch macro. The importer reads these
+    # to emit static-partitioned assets (one Dagster partition per
+    # iteration value) and to rewrite the macro's ControlParam-substituted
+    # Filter condition from a hardcoded operand to `context.partition_key`.
+    batch_macro_parent_id: Optional[str] = None       # parent macro-call tool_id, e.g. "99"
+    batch_macro_control_field: Optional[str] = None   # ControlParam field name, e.g. "Category"
+    batch_macro_control_values: Optional[List[str]] = None  # static iteration values
 
     @property
     def plugin_short(self) -> str:

@@ -112,11 +112,13 @@ def splice_macros(
         _batch_marker = parent_node.config.find(".//Value[@name='BatchMacroGroupBy']")
         _control_params = parent_node.config.find(".//Value[@name='ControlParams']")
         _control_text = (_control_params.text or "").strip() if _control_params is not None else ""
+        # Hoist the defaults so the renumbering below can read these even
+        # when neither BatchMacro nor ControlParams is present (regular
+        # non-batch macros — these stay empty so the importer skips
+        # partition emission).
+        _ctrl_values: List[str] = []
+        _ctrl_field: str = ""
         if _batch_marker is not None or _control_text:
-            # Trace the Control upstream to extract the iteration values if
-            # the source is an inline_dataframe (textinput).
-            _ctrl_values: List[str] = []
-            _ctrl_field: str = ""
             # Parse the `Control Parameter (N)=Field` mapping to find the
             # column name in the Control input.
             import re as _re
@@ -163,8 +165,12 @@ def splice_macros(
             _depth=_depth + 1,
         )
 
-        # Renumber child IDs with a parent-scoped prefix.
+        # Renumber child IDs with a parent-scoped prefix. When the splice
+        # IS a batch macro (control_values populated above), tag every
+        # renumbered node with the parent macro's iteration metadata so
+        # the importer can emit static-partitioned assets downstream.
         prefix = f"m{parent_node.tool_id}_"
+        _is_batch = bool(_ctrl_values) if (_batch_marker is not None or _control_text) else False
         renumbered_nodes = [
             AlteryxNode(
                 tool_id=f"{prefix}{n.tool_id}",
@@ -172,6 +178,9 @@ def splice_macros(
                 annotation=n.annotation,
                 config=n.config,
                 position=n.position,
+                batch_macro_parent_id=parent_node.tool_id if _is_batch else None,
+                batch_macro_control_field=_ctrl_field if _is_batch else None,
+                batch_macro_control_values=list(_ctrl_values) if _is_batch else None,
             )
             for n in child_wf.nodes
         ]
