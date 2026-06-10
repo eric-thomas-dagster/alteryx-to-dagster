@@ -865,6 +865,13 @@ def _map_input_csv(node: AlteryxNode, _upstreams: List[str]) -> MappedTool:
         if file_el is not None:
             _fn_col = file_el.attrib.get("OutputFileName") or "FileName"
             attrs["filename_column_name"] = _fn_col
+        # Alteryx's Input Data emits the basename WITHOUT the extension
+        # (e.g. `bodies_karts` not `bodies_karts.csv`). pandas / our
+        # default emit it WITH the extension. Workflows that filter on
+        # FileName == 'bodies_karts' (very common Alteryx pattern —
+        # Mario Kart, multi-file unions, etc.) silently produce zero
+        # rows otherwise. Opt in by default to match Alteryx semantics.
+        attrs["filename_strip_extension"] = True
         # Parse <FormatSpecificOptions> for delimiter / encoding / header_row.
         # Alteryx Mario Kart sample uses `;` delimiter + cp1252 (CodePage=28591).
         _fopts = node.config.find("FormatSpecificOptions")
