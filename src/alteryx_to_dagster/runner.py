@@ -533,6 +533,40 @@ def import_workflow(
         assert isinstance(result, MappedTool)
         tool_to_asset[node.tool_id] = result.asset_name
 
+        # Resolve bundled file_path references. When the source workflow
+        # was a .yxzp/.yxmz, the importer captured `file_path` as the
+        # relative path inside the bundle (e.g. `Inputs/drivers.csv`,
+        # `Not Your Average Mario Kart\Output.yxdb`). After import the
+        # extraction tempdir is gone, so that relative path is dead.
+        # Copy bundled files into `<out_dir>/data/` and rewrite to a
+        # stable absolute path.
+        _file_path = result.attributes.get("file_path") if isinstance(result.attributes, dict) else None
+        if (
+            isinstance(_file_path, str)
+            and _file_path
+            and not _file_path.startswith(("odbc:", "oledb:", "aka:", "Provider="))
+            and wf.source_dir is not None
+        ):
+            # Normalize Windows-style backslashes from Alteryx XML.
+            _normalized = _file_path.replace("\\", "/")
+            _candidate = wf.source_dir / _normalized
+            try:
+                if _candidate.is_file():
+                    _data_dir = out_dir / "data"
+                    _data_dir.mkdir(parents=True, exist_ok=True)
+                    _dest = _data_dir / _candidate.name
+                    if not _dest.exists() or _dest.stat().st_size != _candidate.stat().st_size:
+                        import shutil as _sh
+                        _sh.copy2(_candidate, _dest)
+                    # Emit RELATIVE path (`data/<basename>`) so the project
+                    # stays portable — the path resolves against Dagster's
+                    # CWD which is the project root. Absolute paths break
+                    # the moment the project gets moved / combined into a
+                    # larger workspace.
+                    result.attributes["file_path"] = f"data/{_dest.name}"
+            except OSError:
+                pass
+
         # Batch-macro: when this node was spliced from an Alteryx batch
         # macro with known iteration values, add static-partition attrs
         # and (for the ControlParam-substituted Filter) rewrite the
