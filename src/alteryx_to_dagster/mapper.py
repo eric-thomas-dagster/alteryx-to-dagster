@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .expr_translator import ExprTranslation, translate as _det_translate
 from .macro_splicer import MACRO_PLUGIN_PREFIX
@@ -3449,46 +3449,98 @@ def _translate_mrf_expression(expr: str, group_cols: List[str]) -> str:
 _PURE_ROW_REF_RE = re.compile(r"^\s*\[Row([+\-])(\d+):([^\]]+)\]\s*$")
 
 
-def _detect_forward_fill(raw_expr: str, out_col: str) -> Optional[str]:
-    r"""Detect the classic Alteryx forward-fill pattern and return the
-    target column to apply pandas `.ffill()` to.
+def _detect_forward_fill(raw_expr: str, out_col: str) -> Optional[Tuple[str, int]]:
+    r"""Detect the Alteryx forward-fill / forward-fill-with-step pattern.
 
-    Both Alteryx idioms below mean "if X is null, use the previous row's
-    X, else keep X" — which in pandas is just `df['X'].ffill()`. The
-    naive `np.where(isna, shift(1), X)` translation is silently WRONG
-    for consecutive nulls (shift returns the original null, not the
-    forward-filled value), so detecting + rewriting matters.
+    Returns `(column, step)` where `step` is the integer to add per
+    null row (0 = plain forward-fill, 1 = monotonic-fill, etc.).
+    Returns None when the expression doesn't match.
 
-      IF IsNull([X]) THEN [Row-1:X] ELSE [X] ENDIF
-      IIF(IsNull([X]), [Row-1:X], [X])
+    Detected shapes (case-insensitive):
+        IF IsNull([X]) THEN [Row-1:X]       ELSE [X] ENDIF   → (X, 0)
+        IIF(IsNull([X]),    [Row-1:X],           [X])         → (X, 0)
+        IF IsNull([X]) THEN [Row-1:X] + N  ELSE [X] ENDIF    → (X, +N)
+        IIF(IsNull([X]),    [Row-1:X] + N,       [X])         → (X, +N)
+        IF IsNull([X]) THEN [Row-1:X] - N  ELSE [X] ENDIF    → (X, -N)
 
-    Returns the column name `X` if matched, else None. The caller emits
-    `formula` with `expressions: {out_col: df['X'].ffill()}`.
+    Why the +N form matters: a common Alteryx idiom is
+    "fill missing years with the previous year + 1" (gap-fill a
+    sequential id / date / period). The naive shift(1)+np.where
+    translation breaks on consecutive nulls because shift returns the
+    ORIGINAL prior value, not the forward-filled one. The correct
+    vectorized pandas form is:
+
+        df['X'].ffill() + (
+            df['X'].isna()
+              .groupby((~df['X'].isna()).cumsum())
+              .cumcount() * N
+        )
+
+    The cumcount-within-null-runs gives 0 for non-null rows and 1, 2,
+    3, ... for consecutive nulls — multiplied by N this stays in lock-
+    step with Alteryx's row-by-row iterative semantics. When N=0 this
+    degenerates to plain ffill.
     """
-    # Strip whitespace + collapse internal whitespace for simpler matching.
     s = re.sub(r"\s+", " ", raw_expr.strip())
+    # Common bits: `IsNull([X])` and `[Row-1:X]`. The optional step
+    # `(\s*([+\-])\s*(\d+))?` captures `+ N` / `- N` (or nothing).
     patterns = [
-        # IF IsNull([X]) THEN [Row-1:X] ELSE [X] ENDIF — case-insensitive
-        # since real workflows mix "IsNull" / "isnull" / "ISNULL".
+        # IF IsNull([X]) THEN [Row-1:X] [(+|-) N] ELSE [X] ENDIF
         re.compile(
             r"^IF\s+(?:IsNull|isnull)\s*\(\s*\[([^\]]+)\]\s*\)\s+"
-            r"THEN\s+\[Row-1:\1\]\s+"
-            r"ELSE\s+\[\1\]\s+ENDIF$",
+            r"THEN\s+\[Row-1:\1\]"
+            r"(?:\s*([+\-])\s*(\d+))?"
+            r"\s+ELSE\s+\[\1\]\s+ENDIF$",
             flags=re.IGNORECASE,
         ),
-        # IIF(IsNull([X]), [Row-1:X], [X])
+        # IIF(IsNull([X]), [Row-1:X] [(+|-) N], [X])
         re.compile(
             r"^IIF\s*\(\s*(?:IsNull|isnull)\s*\(\s*\[([^\]]+)\]\s*\)\s*,\s*"
-            r"\[Row-1:\1\]\s*,\s*"
-            r"\[\1\]\s*\)$",
+            r"\[Row-1:\1\]"
+            r"(?:\s*([+\-])\s*(\d+))?"
+            r"\s*,\s*\[\1\]\s*\)$",
             flags=re.IGNORECASE,
         ),
     ]
     for pat in patterns:
         m = pat.match(s)
         if m:
-            return m.group(1)
+            col = m.group(1)
+            sign, n = m.group(2), m.group(3)
+            step = 0
+            if sign and n:
+                step = int(n) if sign == "+" else -int(n)
+            return (col, step)
     return None
+
+
+def _emit_forward_fill_expr(col: str, step: int, group_cols: List[str]) -> str:
+    """Emit the pandas expression for the detected forward-fill pattern.
+
+    step=0  → simple `df['X'].ffill()`
+    step!=0 → `df['X'].ffill() + (isna.groupby((~isna).cumsum()).cumcount() * step)`
+
+    When group_cols is non-empty, both the ffill and the cumcount must
+    be scoped to the partition so groups don't bleed into each other.
+    """
+    if group_cols:
+        gb = f"df.groupby({group_cols!r}, dropna=False)"
+        ff = f"{gb}[{col!r}].ffill()"
+        if step == 0:
+            return ff
+        isna = f"df[{col!r}].isna()"
+        # Cumcount within null-runs, restarted at each group boundary.
+        cc = (
+            f"({isna}).groupby([{', '.join(repr(c) for c in group_cols)}, "
+            f"(~{isna}).cumsum()]).cumcount()"
+        )
+        return f"{ff} + ({cc} * {step})"
+    ff = f"df[{col!r}].ffill()"
+    if step == 0:
+        return ff
+    isna = f"df[{col!r}].isna()"
+    cc = f"({isna}).groupby((~{isna}).cumsum()).cumcount()"
+    return f"{ff} + ({cc} * {step})"
 
 
 def _has_self_reference(raw_expr: str, out_col: str) -> bool:
@@ -3566,17 +3618,29 @@ def _map_multi_row_formula(node: AlteryxNode, upstreams: List[str]) -> MappedToo
     if "[_CurrentField_]" in raw_expr and is_update and out_col:
         raw_expr = raw_expr.replace("[_CurrentField_]", f"[{out_col}]")
 
-    # Forward-fill shortcut: detect the canonical
-    # `IF IsNull([X]) THEN [Row-1:X] ELSE [X] ENDIF` / IIF form and emit
-    # `df['X'].ffill()` — semantically correct for consecutive nulls,
-    # which the naive np.where+shift translation gets wrong.
-    ff_col = _detect_forward_fill(raw_expr, out_col)
-    if ff_col:
-        ff_expr = (
-            f"df.groupby({group_cols!r}, dropna=False)[{ff_col!r}].ffill()"
-            if group_cols
-            else f"df[{ff_col!r}].ffill()"
-        )
+    # Forward-fill shortcut (and forward-fill-with-step generalization):
+    # detect canonical `IF IsNull([X]) THEN [Row-1:X] [(+|-) N]? ELSE [X]
+    # ENDIF` / IIF forms and emit a vectorized pandas expression that's
+    # semantically correct for consecutive nulls. The naive
+    # shift(1)+np.where translation only fills SINGLE null cells.
+    ff = _detect_forward_fill(raw_expr, out_col)
+    if ff is not None:
+        ff_col, ff_step = ff
+        ff_expr = _emit_forward_fill_expr(ff_col, ff_step, group_cols)
+        if ff_step == 0:
+            note = (
+                f"MultiRowFormula on tool {node.tool_id}: detected forward-fill "
+                f"pattern (IF IsNull THEN [Row-1:X] ELSE [X]) — emitted "
+                f"`{ff_col}.ffill()` which correctly handles consecutive nulls."
+            )
+        else:
+            note = (
+                f"MultiRowFormula on tool {node.tool_id}: detected forward-fill-"
+                f"with-step pattern (IF IsNull THEN [Row-1:{ff_col}] + {ff_step} "
+                f"ELSE [{ff_col}]) — emitted `ffill() + cumcount*{ff_step}` so "
+                "consecutive nulls fill with prev+step, prev+2·step, prev+3·step, "
+                "matching Alteryx's row-by-row semantics."
+            )
         return MappedTool(
             component_id="formula",
             asset_name=_asset_name_for(node),
@@ -3585,12 +3649,7 @@ def _map_multi_row_formula(node: AlteryxNode, upstreams: List[str]) -> MappedToo
                 "expressions": {out_col: ff_expr},
                 "group_name": "alteryx_imported",
             },
-            notes=[
-                f"MultiRowFormula on tool {node.tool_id}: detected forward-fill "
-                f"pattern (IF IsNull THEN [Row-1:X] ELSE [X]) — emitted "
-                f"`{ff_col}.ffill()` which correctly handles consecutive "
-                "nulls (unlike the naive shift(1)+np.where translation)."
-            ],
+            notes=[note],
         )
 
     # Pure single-token [Row±N:Col]? Map to window_calculation.lag/lead.
