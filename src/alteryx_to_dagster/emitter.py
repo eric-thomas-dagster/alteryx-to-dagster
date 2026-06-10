@@ -140,13 +140,13 @@ def emit_yaml(
     defs_dir.mkdir(parents=True, exist_ok=True)
     defs_path = defs_dir / "defs.yaml"
 
-    # v0.5 emitter: type lines use the lazy `dagster_community_components.<ClassName>`
-    # form so the wheel install resolves directly (force-include puts each
-    # component file under dagster_community_components/...). The earlier
-    # `<pkg>.components.<id>.component.<ClassName>` form required
-    # `dagster-component add` to wire each component into the project; this
-    # form works out of the box once the wheel is on PYTHONPATH.
-    type_line = f"dagster_community_components.{class_name}"
+    # Emit the LOCAL type-ref form that `dagster-component add` produces
+    # on its own (`<pkg>.components.<id>.component.<ClassName>`). The
+    # per-component install is the recommended path — no umbrella
+    # `dagster_community_components` dependency required, and the YAML
+    # works the moment `dagster-component add <id>` copies the component
+    # file into the project.
+    type_line = f"{pkg}.components.{component_id}.component.{class_name}"
     # asset_name lives on MappedTool (and is what we used to pick the folder
     # name above) but most components also require it as an attribute. Merge
     # it in unless the caller already supplied one in `attributes`.

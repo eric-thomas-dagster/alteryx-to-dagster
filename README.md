@@ -9,29 +9,50 @@ Standalone CLI — **does not require an Alteryx Designer install or any Alteryx
 ## Install + use
 
 ```bash
-uvx --from alteryx-to-dagster alteryx-to-dagster --help
+uvx --from git+https://github.com/eric-thomas-dagster/alteryx-to-dagster \
+    alteryx-to-dagster --help
 ```
 
-End-to-end:
+(PyPI publish pending — install from the git source for now.)
+
+### One-command zero-config import
 
 ```bash
-# 1. Scaffold a fresh Dagster project
-uvx create-dagster@latest project my_project --no-uv-sync
-cd my_project
-uv add --dev dagster-dg-cli dagster-webserver
-uv add pandas numpy
-
-# 2. Convert the Alteryx workflow into it
-uvx --from alteryx-to-dagster alteryx-to-dagster import \
-    /path/to/workflow.yxmd \
-    --out-dir . --pkg my_project --install
-
-# 3. Validate + run
-uv run dg check defs            # all generated YAML loads cleanly
-uv run dg dev                   # asset graph at http://localhost:3000
+uvx --from git+https://github.com/eric-thomas-dagster/alteryx-to-dagster \
+    alteryx-to-dagster import /path/to/workflow.yxmd
 ```
 
-The `--install` flag shells out to `dagster-component add <id> --auto-install` for every registry component the importer used.
+That single command:
+
+- Scaffolds a fresh Dagster project at `./<workflow_stem>/` (via `uvx create-dagster project`)
+- Imports the workflow into it
+- Runs `dagster-component add <id> --auto-install` for each registry component used
+- Adds `pandas`, `numpy`, `dagster-dg-cli`, `dagster-webserver` to `pyproject.toml` (the registry components need them at runtime; `dagster-component add` doesn't propagate their `requirements.txt`)
+
+Then `cd <workflow_stem> && uv run dg dev` opens the asset graph at http://localhost:3000.
+
+### Folder mode — many workflows at once
+
+Point at a directory and every `.yxmd` / `.yxzp` / `.yxmz` inside it gets imported into the same Dagster project:
+
+```bash
+uvx --from git+https://github.com/eric-thomas-dagster/alteryx-to-dagster \
+    alteryx-to-dagster import /path/to/workflows/
+```
+
+### Common overrides
+
+```bash
+# Custom output directory + package name
+alteryx-to-dagster import workflow.yxmd --out-dir my_proj --pkg my_proj
+
+# Skip the auto-install (you'll handle deps + components yourself)
+alteryx-to-dagster import workflow.yxmd --no-install
+
+# Pre-scaffold the Dagster project yourself (skip auto-bootstrap)
+uvx create-dagster@latest project my_proj --uv-sync
+alteryx-to-dagster import workflow.yxmd --out-dir my_proj
+```
 
 ## Tool coverage
 
