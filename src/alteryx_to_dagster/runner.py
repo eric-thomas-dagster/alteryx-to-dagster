@@ -79,6 +79,26 @@ def _rewrite_controlparam_filter(
     return pat.sub(lambda m: f"{m.group(1)}{m.group(2)}context.partition_key", condition)
 
 
+def _rewrite_controlparam_value(expr: str, *, values: List[str]) -> str:
+    r"""Replace any quoted occurrence of a ControlParam value with
+    `context.partition_key`. Used for batch-macro v2 substitutions
+    inside Formula expressions (and anywhere else where the iteration
+    value appears as a literal string).
+
+    Conservative: only matches values from the known iteration set,
+    only when wrapped in single or double quotes. Bare identifiers /
+    substrings of larger strings stay untouched.
+    """
+    import re as _re
+    if not values:
+        return expr
+    _alt = "|".join(_re.escape(v) for v in values if v)
+    if not _alt:
+        return expr
+    pat = _re.compile(rf"""(['"])\s*(?:{_alt})\s*\1""")
+    return pat.sub("context.partition_key", expr)
+
+
 def _columns_needed_downstream(wf: AlteryxWorkflow, origin_tool_id: str) -> tuple:
     """Scan downstream tools of `origin_tool_id` and return:
 
@@ -587,25 +607,77 @@ def import_workflow(
                 "partition_values",
                 ",".join(node.batch_macro_control_values),
             )
-            # Filter substitution: if this filter's condition is
-            # `df['<control_field>'] == '<value>'` where value is in the
-            # control_values list, replace with context.partition_key.
-            if result.component_id == "filter" and node.batch_macro_control_field:
-                _cond = attrs.get("condition")
-                if isinstance(_cond, str):
-                    _new_cond = _rewrite_controlparam_filter(
-                        _cond,
-                        field=node.batch_macro_control_field,
-                        values=node.batch_macro_control_values,
-                    )
-                    if _new_cond != _cond:
-                        attrs["condition"] = _new_cond
+            # ControlParam substitution: hardcoded value-strings inside
+            # the macro's internal tools get rewritten to
+            # `context.partition_key` so each Dagster partition runs the
+            # macro for the right iteration value. v2 covers Filter,
+            # Formula, Summarize.group_by, SelectColumns.rename, and any
+            # other attribute that holds string values matching the
+            # ControlParam value set.
+            if node.batch_macro_control_field and node.batch_macro_control_values:
+                _f = node.batch_macro_control_field
+                _vals = node.batch_macro_control_values
+                _value_set = set(_vals)
+                # Filter — condition string rewrite (v1 path).
+                if result.component_id == "filter":
+                    _cond = attrs.get("condition")
+                    if isinstance(_cond, str):
+                        _new = _rewrite_controlparam_filter(_cond, field=_f, values=_vals)
+                        if _new != _cond:
+                            attrs["condition"] = _new
+                            result.notes.append(
+                                f"Batch macro: filter condition rewired "
+                                f"from hardcoded value to `context.partition_key`."
+                            )
+                # Formula — every expression that's a bare quoted value
+                # in the ControlParam set gets swapped to context.partition_key.
+                if result.component_id == "formula":
+                    _exprs = attrs.get("expressions")
+                    if isinstance(_exprs, dict):
+                        _swapped: List[str] = []
+                        for k, v in list(_exprs.items()):
+                            if isinstance(v, str):
+                                _new = _rewrite_controlparam_value(v, values=_vals)
+                                if _new != v:
+                                    _exprs[k] = _new
+                                    _swapped.append(k)
+                        if _swapped:
+                            result.notes.append(
+                                f"Batch macro: formula expression(s) "
+                                f"{_swapped} rewired from hardcoded value "
+                                "to `context.partition_key`."
+                            )
+                # Summarize — when group_by includes the ControlParam
+                # field, drop it (each partition's data already shares
+                # that value, so grouping by it is a no-op that just
+                # bloats the output). Surface a note.
+                if result.component_id == "summarize":
+                    _gb = attrs.get("group_by")
+                    if isinstance(_gb, list) and _f in _gb:
+                        attrs["group_by"] = [c for c in _gb if c != _f]
                         result.notes.append(
-                            f"Batch macro: filter condition rewired from "
-                            f"hardcoded `{_cond}` to `context.partition_key` "
-                            f"so it varies per-partition over "
-                            f"{node.batch_macro_control_values}."
+                            f"Batch macro: dropped `{_f}` from summarize "
+                            "group_by (each partition contains only one "
+                            "value of that field — grouping is redundant)."
                         )
+                # SelectColumns — `rename` map values that equal a
+                # ControlParam value would in Alteryx be substituted by
+                # the iteration value. Pandas doesn't support per-row
+                # rename, so flag as a manual-edit case.
+                if result.component_id == "select_columns":
+                    _rn = attrs.get("rename")
+                    if isinstance(_rn, dict):
+                        _hits = [k for k, v in _rn.items() if isinstance(v, str) and v in _value_set]
+                        if _hits:
+                            result.notes.append(
+                                f"Batch macro: select_columns rename "
+                                f"target(s) {_hits} match ControlParam "
+                                "values; Alteryx would substitute per "
+                                "iteration. Pandas rename can't vary "
+                                "per-row — manual edit required if you "
+                                "want column names that include the "
+                                "partition key (use a Formula instead)."
+                            )
 
         if result.inline_python:
             path = emit_inline_python(out_dir, pkg, result.asset_name, result.inline_python)
