@@ -4328,6 +4328,12 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
         # detect when upstream emits a Shapely geom column directly (PolyBuild,
         # CreatePoints, geocoder) — pass it as points_geometry_column instead
         # of relying on lat/lng numerics.
+        # NOTE: SpatialMatch also embeds a <SelectConfiguration><SelectFields>
+        # block (same shape as Join) that renames/drops output columns. The
+        # spatial_join component doesn't yet accept rename/drop_columns; once
+        # it does, plumb through SelectFields like _map_join does. Until then
+        # downstream tools referencing the renamed columns (e.g. NewAddress
+        # from Target_address) will KeyError — surfaced in MIGRATION.md.
         lambda node, upstreams: (lambda tgt_el, uni_el: MappedTool(
             component_id="spatial_join" if len(upstreams) > 1 else "point_in_polygon",
             asset_name=_asset_name_for(node),
@@ -4359,7 +4365,11 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
                 f"{('spatial_join' if len(upstreams) > 1 else 'point_in_polygon')}. "
                 "Confirm lat_column / lng_column match your data. For "
                 "point_in_polygon, set geojson_path or geojson_url to the "
-                "polygon source."
+                "polygon source. NOTE: embedded SelectConfiguration "
+                "renames/drops are NOT yet applied — if downstream tools "
+                "reference renamed columns (e.g. NewAddress), they will "
+                "KeyError. Add a downstream rename step or wait for "
+                "spatial_join.rename/drop_columns support."
             ],
         ))(node.config.find("Target"), node.config.find("Universe"))
     ),

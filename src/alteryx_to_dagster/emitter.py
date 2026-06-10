@@ -439,11 +439,46 @@ def emit_migration_report(
             "observability. Just `for v in control_values: ...` inside the "
             "downstream asset's compute, return the unioned DataFrame.",
             "",
-            "**What we did**: spliced each batch macro inline (one pass) so "
-            "the asset graph topology is correct. The chain runs with the "
-            "first iteration's value(s) only. Restore the iteration by "
-            "rewriting the downstream consumer(s) to use one of the patterns "
-            "above.",
+            "**What the importer does today** (v1, automatic when "
+            "iteration values are statically known from the Control input):",
+            "",
+            "1. Splices each batch macro inline so the asset graph topology "
+            "is correct.",
+            "2. Adds `partition_type: static, partition_values: [v1, v2, ...]` "
+            "to every macro-internal asset — one Dagster partition per "
+            "iteration value.",
+            "3. Rewrites the macro's ControlParam-bound Filter / Formula / "
+            "Summarize attributes from the hardcoded design-time value to "
+            "`context.partition_key`, so each partition's run filters / "
+            "computes for its own iteration.",
+            "4. Unpartitioned downstream tools (CrossTab / Sort / etc.) read "
+            "ALL partitions via Dagster's default `AllPartitionMapping` — the "
+            "components auto-concat the per-partition dict into a single "
+            "DataFrame so the union semantics work out of the box.",
+            "",
+            "**How to materialize** (important — partitioned assets fail "
+            "with `DagsterInvariantViolationError: Cannot access "
+            "partition_key for a non-partitioned run` if you click "
+            "Materialize on them without specifying a partition):",
+            "",
+            "- In **Dagit**: right-click a macro-internal asset → "
+            "**Materialize all partitions** (or pick a specific one).",
+            "- Via **CLI**: `dg launch --assets +<terminal_asset> "
+            "--partition <key>` (or omit `--partition` for the unpartitioned "
+            "downstream, which auto-loads all upstream partitions).",
+            "- Iterate over all partitions with a small Python loop calling "
+            "`dagster.materialize(..., partition_key=k)` for each value.",
+            "",
+            "**v1 gaps** worth manual review:",
+            "",
+            "- Action tools that substitute into Formula expressions or "
+            "Summarize group_by lists — only Filter substitution is covered "
+            "automatically.",
+            "- Batch macros whose ControlParam values come from a DYNAMIC "
+            "upstream (not a Text Input) — those need `DynamicPartitionsDefinition` "
+            "+ a key-registration sensor (or DynamicOut for in-run fan-out).",
+            "- Nested batch macros (batch inside batch) — only the outermost "
+            "is partitioned today.",
             "",
             "| Tool ID | Macro | Iteration param | Control field | Values observed |",
             "|---|---|---|---|---|",
