@@ -47,13 +47,13 @@ The `--install` flag shells out to `dagster-component add <id> --auto-install` f
 | **GenerateRows** | per-row Expression_Init/Cond/Loop expansion | `generate_rows` mode `loop_expression` — emits one row per loop iteration; integer / date / datetime stepping all work |
 | **Spatial — full palette** | Create Points · Buffer · Geocoder · Geo Overlay · Geo Simplify · Drive Time · Poly Build · Poly Split · Spatial Info · Spatial Match · Spatial Process · Distance · Find Nearest · Make Group · Smooth / Generalize · Map Input · Trade Area · Heat Map · Demographic · Report Map | `points_from_latlon` · `geo_buffer` · `geocoder` (Nominatim default) · `geo_overlay` · `geo_simplify` · `drive_time` (openrouteservice / google / mapbox / osrm) · `poly_build` · inline polysplit · `spatial_info` · `spatial_join` · `spatial_process` (centroid / boundary / convex_hull / envelope / simplify / buffer / set_precision / polygon↔points / line↔polygon) · `distance_calculator` · `nearest_neighbors` (FindNearest's k=1 distance → `DistanceMiles`) · `summarize` w/ spatialobjcombine · `spatial_process.simplify` · `file_ingestion` · `drive_time` w/ travel-mode · passthrough · passthrough · passthrough |
 | **CASS / Address standardization** | CASS · Address Verification | `address_standardize` (free, no API key required for `regex` mode; libpostal / Geoapify / Nominatim available; USPS CASS-certification is paid — use a commercial vendor for DPV) |
-| **Predictive** | Linear / Logistic / Decision Tree / Random Forest / Naive Bayes / Neural Network / SVM / Gradient Boosting / PCA / Score | sklearn-backed registry components w/ `model_path` joblib save; Score loads a saved model and predicts |
+| **Predictive** | Linear / Logistic / Decision Tree / Random Forest / Naive Bayes / Neural Network / SVM / Gradient Boosting / PCA / Score · Find Nearest Neighbors · K-Centroids Cluster Analysis · K-Centroids Diagnostics · Append Cluster · MB Rules · MB Inspect · Model Comparison · Create Samples · Random Records · Frequency · IFS | sklearn-backed registry components w/ `model_path` joblib save; Score loads a saved model and predicts. **Alteryx Predictive Tools stock macros** (`Find_Nearest_Neighbors.yxmc`, `Forest_Model.yxmc`, `K-Centroids_Cluster_Analysis.yxmc`, `MB_Rules.yxmc`, `Model Comparison.yxmc`, etc.) route to their dedicated registry components with **`feature_columns` / `target_column` / `n_neighbors` / `n_estimators` / `max_depth` extracted automatically** from the macro CALL's `<Configuration>` block — no manual editing required for the standard cases. |
 | **Time Series** | TS Forecast / TS Plot · ARIMA · ETS · Time Series Filler · Imputation | `arima_forecast` · `ets_forecast` · passthrough · `data_cleansing` (stock macros routed: `predictive_tools\arima.yxmc` etc.) |
 | **R Tool / Jupyter Code** | R Tool · Jupyter Code | Inline `@dg.asset` stub with the original script preserved as a comment block. Port to Python or wrap with `rpy2` / `subprocess Rscript` / `dagstermill`. |
 | **In-DB** (SQL pushdown — collapsed) | Connect · Input · Filter · Formula · Select · Summarize · Join · Union · Sample · Stream Out · Write Data | Connected In-DB subgraphs collapse into ONE `warehouse_pipeline` asset (CTE chain, single warehouse round-trip). Stream Out sinks route via `return_dataframe: true` so downstream non-In-DB tools consume a DataFrame. Connection env var is slugified from `<Connection>` (e.g. `Snowflake_Prod` → `SNOWFLAKE_PROD_URL`); SQL dialect auto-detected from the connection name. |
 | **Reporting** | Render · Portfolio Composer (Image / Render / Table / Text / Layout / Overlay) | `pdf_report` for Render / Image. Composer Table / Text emit passthrough so downstream Joins keep working; combine with the terminal Render's `pdf_report` template_html for full styled layout. Layout / Overlay are visual-only — skipped. |
 | **Apps / Interface** | Tab · CheckBoxGroup · NumericUpDown · Label · Control Parameter · Action · Macro Input/Output | Skipped as control-flow with notes — Alteryx App interface tools have no Dagster-runtime equivalent. The compute inside the App (under ToolContainers) still imports. |
-| **Macros (`.yxmc`)** | Custom macros · stock macros (Cleanse) | `macro_splicer.py` recursively inlines `.yxmc` (max depth 5), renumbers tool_ids with `m<parent>_` prefix, rewires Macro Input/Output anchors. Stock macros (Cleanse, etc.) route to dedicated registry components instead of inlining. |
+| **Macros (`.yxmc`)** | Custom user macros · Alteryx stock macros · CReW community macros | `macro_splicer.py` recursively inlines custom `.yxmc` (max depth 5), renumbers tool_ids with `m<parent>_` prefix, rewires Macro Input/Output anchors. **Stock macros** (Cleanse, ARIMA, ETS, Imputation_v2, TimeSeriesFiller, OversampleField, Histogram, Field_Summary_Report, SelectRecords, CountRecords, WeightedAvg, RandomRecords, Frequency, IFS, Create_Samples, Append_Cluster, Find_Nearest_Neighbors, Forest_Model, Decision_Tree, Linear_Regression, Logistic_Regression, K-Centroids_Cluster_Analysis, K-Centroids_Diagnostics, MB_Rules, MB_Inspect, Model_Comparison) route to dedicated registry components, with **config fields like `feature_columns`, `target_column`, `n_neighbors`, `sample_size`, `seed`** auto-extracted from the macro CALL's `<Configuration>`. CReW macros (`crew_expectequal`, `crew_ensurefields`) → passthrough. |
 | **Control flow** | Block Until Done · Cache Dataset · Browse · Message · Detour · Tool Container · Comment · Text Box · HTMLBox | Skipped (Dagster's DAG / IO manager / `AutomationCondition` already provides Block Until Done / Cache; visual-only tools have no runtime equivalent). Tool Container's INNER tools still get imported. |
 
 ## Formula translation — deterministic, no LLM needed
@@ -112,20 +112,48 @@ If you hit a gap not listed here, open an issue with the Alteryx XML and we'll a
 
 ## Validation corpus
 
-Continuously tested against **106 real Alteryx workflows** drawn from:
+Continuously tested against **138 real Alteryx workflows** drawn from:
 
 - [Alteryx Weekly Challenge community board](https://community.alteryx.com/categories/weeklychallenge-board) (atcodedog05 + sh0kat solution sets) — 83 .yxmd
 - [Szymon-Czuszek Weekly Challenges](https://github.com/Szymon-Czuszek/Alteryx-Weekly-Challenges) — 19 .yxmd / .yxzp (Alteryx Apps included)
-- [Szymon-Czuszek Superstore Reporting](https://github.com/Szymon-Czuszek/Superstore-Reporting) — 1 .yxzp
+- [Szymon-Czuszek Superstore Reporting](https://github.com/Szymon-Czuszek/Superstore-Reporting) — 1 .yxzp (450+ tools across nested batch macros)
 - [osabnis1776 iShares ETF Analysis](https://github.com/osabnis1776/iShares-IVV-ETF-Market-Risk-Analysis) — 1 .yxmd
 - [OwenBData R-vs-Alteryx](https://github.com/OwenBData/RvsAlteryxBlog) — 1 .yxmd
 - **Mario Kart challenge 498** (.yxzp w/ bundled macro) — 1 workflow
+- [Alteryx Learnable Intro tutorials](https://github.com/learnable-content/alteryx-intro) — 30 .yxmd covering core transforms + the full Predictive Tools palette (KNN, K-Means, Random Forest, Decision Tree, Linear / Logistic Regression, Market Basket, Data Investigation)
 
 Current stats:
 
-- Real-compute mapping rate: **~99%** (1372 / 1386 non-control-flow tools)
+- Real-compute mapping rate: **~99%** (1372 / 1386 non-control-flow tools across the corpus)
 - Static validation pass: **100%** (every emitted defs.yaml loads under `dg check`)
 - Materialization rate (with auto-stubbed inputs): **~66%** and rising; remaining failures are split between Alteryx-internal workflow quirks (a few tools reference output cols before they're created) and stub-data dtype mismatches that don't bite real production data.
+
+### Example: Find_Nearest_Neighbors stock macro
+
+A KNN workflow's `Find_Nearest_Neighbors.yxmc` call XML:
+
+```xml
+<Value name="select.id">FruitID</Value>
+<Value name="select.fields">FruitID=False,mass=True,width=True,height=True,color_score=True</Value>
+<Value name="the_k">2</Value>
+<Value name="standardize">True</Value>
+<Value name="algo.kd_tree">True</Value>
+```
+
+Becomes:
+
+```yaml
+type: dagster_community_components.NearestNeighborsComponent
+attributes:
+  feature_columns: [mass, width, height, color_score]
+  n_neighbors: 2
+  normalize: true
+  algorithm: kd_tree
+  upstream_asset_key: join_6
+  asset_name: yxmc_7
+```
+
+Materializable as-is — no placeholder editing required.
 
 ## License
 

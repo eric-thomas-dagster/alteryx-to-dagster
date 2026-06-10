@@ -383,11 +383,41 @@ def import_workflow(
         )
         return ph_name
 
+    _BROWSE_PLUGINS = {
+        "AlteryxBasePluginsGui.Browse.Browse",
+        "AlteryxBasePluginsGui.BrowseV2.BrowseV2",
+    }
+    _by_id = wf.by_id()
+
+    def _only_feeds_browse(tool_id: str) -> bool:
+        downs = wf.downstreams_of(tool_id)
+        if not downs:
+            return False
+        for e in downs:
+            tgt = _by_id.get(e.dest_tool)
+            if tgt is None or tgt.plugin not in _BROWSE_PLUGINS:
+                return False
+        return True
+
     for node in ordered:
         # Tools collapsed into a warehouse_pipeline group already have their
         # asset_name set in tool_to_asset; skip the per-tool sql_transform
         # mapping for them.
         if node.tool_id in _collapsed_tool_ids:
+            continue
+
+        # Sources whose only downstream is Alteryx Browse (a data-preview UI
+        # tool we skip) become orphan assets in Dagster — Browse has no
+        # Dagster equivalent. Drop them so the asset graph reflects the
+        # real pipeline, not analyst scratch.
+        if node.plugin == "AlteryxBasePluginsGui.TextInput.TextInput" and _only_feeds_browse(node.tool_id):
+            unmapped_results.append((
+                node.tool_id, node.plugin,
+                "TextInput feeds only Browse (data-preview UI). Dropped — no "
+                "Dagster equivalent (materialize the asset to see preview metadata).",
+                "If you want to keep this as a reference table, manually emit "
+                "an inline_dataframe component for it.",
+            ))
             continue
 
         # Resolve upstreams in connection-anchor order so e.g. Join's Left/Right

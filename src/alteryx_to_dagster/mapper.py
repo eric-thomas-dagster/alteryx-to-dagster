@@ -2842,6 +2842,101 @@ _STOCK_MACRO_COMPONENTS: Dict[str, Any] = {
         # time — see _map_alteryx_macro special-case below.
         "attributes": {},
     },
+    "randomrecords.yxmc": {
+        "component_id": "sample",
+        # Number/NNumber/Percent/NPercent/Seed pulled from <Configuration>
+        # at map time — see _map_alteryx_macro.
+        "attributes": {"method": "random"},
+    },
+    "frequency.yxmc": {
+        "component_id": "summarize",
+        # Whole-frame freq table; user typically wants group_by=<col>, agg=count
+        # — left as a placeholder so dg check doesn't error and user can fill in.
+        "attributes": {"group_by": [], "aggregations": {}},
+    },
+    "ifs.yxmc": {
+        # Alteryx IFS = cascading if/elif. Closest registry equivalent is the
+        # `formula` component (which already accepts np.select-style
+        # expressions). Emit a stub the user fills in.
+        "component_id": "formula",
+        "attributes": {"expressions": {}},
+    },
+    # Alteryx Predictive Tools — stock macros that wrap proprietary algos.
+    # Each maps to a dedicated registry component we already ship. Most
+    # require feature_columns / target_column which the user must set in
+    # the emitted defs.yaml (we can't reliably auto-derive from the
+    # macro call config without parsing field-selector controls).
+    "find_nearest_neighbors.yxmc": {
+        "component_id": "nearest_neighbors",
+        "attributes": {"feature_columns": ["TODO_set_feature_columns"]},
+    },
+    "forest_model.yxmc": {
+        "component_id": "random_forest_model",
+        "attributes": {
+            "target_column": "TODO_set_target_column",
+            "feature_columns": ["TODO_set_feature_columns"],
+        },
+    },
+    "decision_tree.yxmc": {
+        "component_id": "decision_tree_model",
+        "attributes": {
+            "target_column": "TODO_set_target_column",
+            "feature_columns": ["TODO_set_feature_columns"],
+        },
+    },
+    "linear_regression.yxmc": {
+        "component_id": "linear_regression_model",
+        "attributes": {
+            "target_column": "TODO_set_target_column",
+            "feature_columns": ["TODO_set_feature_columns"],
+        },
+    },
+    "logistic_regression.yxmc": {
+        "component_id": "logistic_regression_model",
+        "attributes": {
+            "target_column": "TODO_set_target_column",
+            "feature_columns": ["TODO_set_feature_columns"],
+        },
+    },
+    "k-centroids_cluster_analysis.yxmc": {
+        "component_id": "k_means_clustering",
+        "attributes": {"feature_columns": ["TODO_set_feature_columns"]},
+    },
+    "k-centroids_diagnostics.yxmc": {
+        "component_id": "k_means_clustering",
+        "attributes": {"feature_columns": ["TODO_set_feature_columns"]},
+    },
+    "append_cluster.yxmc": {
+        "component_id": "append_cluster",
+        "attributes": {"feature_columns": ["TODO_set_feature_columns"]},
+    },
+    "mb_rules.yxmc": {
+        "component_id": "market_basket_rules",
+        "attributes": {
+            "basket_column": "TODO_set_basket_column",
+            "item_column": "TODO_set_item_column",
+        },
+    },
+    "mb_inspect.yxmc": {
+        "component_id": "market_basket_rules",
+        "attributes": {
+            "basket_column": "TODO_set_basket_column",
+            "item_column": "TODO_set_item_column",
+        },
+    },
+    "model comparison.yxmc": {
+        "component_id": "model_comparison",
+        "attributes": {
+            "target_column": "TODO_set_target_column",
+            "feature_columns": ["TODO_set_feature_columns"],
+        },
+    },
+    "create_samples.yxmc": {
+        "component_id": "create_samples",
+        # Default Alteryx Create_Samples is 60/20/20 train/valid/test;
+        # registry default is 80/20 train/test — user adjusts.
+        "attributes": {"test_size": 0.2},
+    },
 }
 
 
@@ -2898,6 +2993,173 @@ def _map_alteryx_macro(node: AlteryxNode, upstreams: List[str]):
                     defaults["method"] = "range"
                     defaults["range_start"] = int(_m.group(1))
                     defaults["range_end"] = int(_m.group(2))
+        # --- Helpers for Predictive Tools macro config extraction ---
+        def _cfg_value(name: str) -> str | None:
+            """Read `<Value name="X">text</Value>` from the macro CALL config."""
+            for _v in node.config.findall("Value"):
+                if _v.attrib.get("name") == name and _v.text is not None:
+                    return _v.text.strip()
+            return None
+
+        def _parse_plus_list(s: str | None) -> list[str]:
+            """Split `'A + B + C'` (or `'A+B+C'`) → ['A', 'B', 'C']."""
+            if not s:
+                return []
+            return [t.strip() for t in s.split("+") if t.strip()]
+
+        def _parse_select_fields(s: str | None) -> list[str]:
+            """Parse `'col1=True,col2=False,col3=True'` → ['col1', 'col3']."""
+            if not s:
+                return []
+            result = []
+            for token in s.split(","):
+                if "=" in token:
+                    k, v = token.split("=", 1)
+                    if v.strip().lower() == "true":
+                        result.append(k.strip())
+            return result
+
+        # --- Find_Nearest_Neighbors: select.fields / the_k / standardize / algo.*
+        if component_id == "nearest_neighbors" and _bare.lower() == "find_nearest_neighbors.yxmc":
+            feats = _parse_select_fields(_cfg_value("select.fields"))
+            if feats:
+                defaults["feature_columns"] = feats
+            k_val = _cfg_value("the_k")
+            if k_val and k_val.isdigit():
+                defaults["n_neighbors"] = int(k_val)
+            if (_cfg_value("standardize") or "").lower() == "true":
+                defaults["normalize"] = True
+            elif (_cfg_value("standardize") or "").lower() == "false":
+                defaults["normalize"] = False
+            # algorithm: kd_tree | cover_tree | VR | CR | brute. Map to
+            # nearest_neighbors component's enum: auto|ball_tree|kd_tree|brute.
+            for _algo, _mapped in (
+                ("algo.kd_tree", "kd_tree"),
+                ("algo.cover_tree", "ball_tree"),  # closest sklearn analogue
+                ("algo.brute", "brute"),
+            ):
+                if (_cfg_value(_algo) or "").lower() == "true":
+                    defaults["algorithm"] = _mapped
+                    break
+
+        # --- Forest_Model / Decision_Tree / Linear/Logistic_Regression:
+        #     Y Var (target) + X Vars (`+ `-separated features)
+        if component_id in (
+            "random_forest_model", "decision_tree_model",
+            "linear_regression_model", "logistic_regression_model",
+        ):
+            y_var = _cfg_value("Y Var")
+            x_vars = _parse_plus_list(_cfg_value("X Vars"))
+            if y_var:
+                defaults["target_column"] = y_var
+            if x_vars:
+                defaults["feature_columns"] = x_vars
+            if component_id == "random_forest_model":
+                n_trees = _cfg_value("Num Trees")
+                if n_trees and n_trees.isdigit():
+                    defaults["n_estimators"] = int(n_trees)
+                max_d = _cfg_value("max.depth")
+                if max_d and max_d.isdigit():
+                    defaults["max_depth"] = int(max_d)
+
+        # --- Model Comparison: same Y Var / X Vars convention
+        if component_id == "model_comparison":
+            y_var = _cfg_value("Y Var")
+            x_vars = _parse_plus_list(_cfg_value("X Vars"))
+            if y_var:
+                defaults["target_column"] = y_var
+            if x_vars:
+                defaults["feature_columns"] = x_vars
+
+        # --- K-Centroids_Cluster_Analysis / K-Centroids_Diagnostics:
+        #     `the fields` (`+ ` features) + `num clus` + normalization
+        if component_id == "k_means_clustering":
+            feats = _parse_plus_list(_cfg_value("the fields"))
+            if feats:
+                defaults["feature_columns"] = feats
+            n_clus = _cfg_value("num clus")
+            if n_clus and n_clus.isdigit():
+                defaults["n_clusters"] = int(n_clus)
+            if (_cfg_value("standardize") or "").lower() == "true":
+                defaults["normalize"] = True
+            elif (_cfg_value("standardize") or "").lower() == "false":
+                defaults["normalize"] = False
+
+        # --- MB_Rules / MB_Inspect:
+        #     basket-id field + item field. Alteryx names vary; cover the
+        #     two common patterns (`Items` / `IDs` and `item` / `basket`).
+        if component_id == "market_basket_rules":
+            for _basket_key in ("IDs", "basket", "ID"):
+                v = _cfg_value(_basket_key)
+                if v:
+                    defaults["basket_column"] = v
+                    break
+            for _item_key in ("Items", "item", "Item"):
+                v = _cfg_value(_item_key)
+                if v:
+                    defaults["item_column"] = v
+                    break
+
+        # --- Create_Samples: estimation% / validation% / holdout%
+        if component_id == "create_samples":
+            est = _cfg_value("Estimation Percent")
+            val = _cfg_value("Validation Percent")
+            hold = _cfg_value("Holdout Percent")
+            # Alteryx default is 50/30/20 train/valid/test. Convert to
+            # registry's test_size + validation_size.
+            try:
+                est_f = float(est) if est else None
+                val_f = float(val) if val else None
+                hold_f = float(hold) if hold else None
+            except (ValueError, TypeError):
+                est_f = val_f = hold_f = None
+            if hold_f is not None:
+                defaults["test_size"] = hold_f / 100.0
+            if val_f is not None:
+                defaults["validation_size"] = val_f / 100.0
+
+        if component_id == "sample" and _bare.lower() == "randomrecords.yxmc":
+            # RandomRecords.yxmc config:
+            #   <Value name="Number">True</Value>      ← absolute-count mode
+            #   <Value name="NNumber">5000</Value>     ← record count
+            #   <Value name="Percent">False</Value>    ← percent mode
+            #   <Value name="NPercent">99</Value>      ← percentage value
+            #   <Value name="Deterministic">False</Value>
+            #   <Value name="Seed">458676342</Value>
+            cfg = node.config
+            _mode_num = _mode_pct = False
+            _n = _pct = _seed = None
+            _deterministic = False
+            for _v in cfg.findall("Value"):
+                _name = _v.attrib.get("name", "")
+                _text = (_v.text or "").strip()
+                if _name == "Number" and _text.lower() == "true":
+                    _mode_num = True
+                elif _name == "Percent" and _text.lower() == "true":
+                    _mode_pct = True
+                elif _name == "NNumber":
+                    try:
+                        _n = int(_text)
+                    except (ValueError, TypeError):
+                        pass
+                elif _name == "NPercent":
+                    try:
+                        _pct = float(_text)
+                    except (ValueError, TypeError):
+                        pass
+                elif _name == "Deterministic" and _text.lower() == "true":
+                    _deterministic = True
+                elif _name == "Seed":
+                    try:
+                        _seed = int(_text)
+                    except (ValueError, TypeError):
+                        pass
+            if _mode_num and _n is not None:
+                defaults["sample_size"] = _n
+            elif _mode_pct and _pct is not None:
+                defaults["frac"] = _pct / 100.0
+            if _deterministic and _seed is not None:
+                defaults["random_state"] = _seed
         if component_id == "weighted_average":
             cfg = node.config
             _val = _weight = _group = _out = None
@@ -2921,15 +3183,30 @@ def _map_alteryx_macro(node: AlteryxNode, upstreams: List[str]):
                 defaults["group_by"] = [g.strip() for g in _group.split(",") if g.strip()]
             if _out:
                 defaults["output_column"] = _out
+        # Flag fields the user must set before materialization.
+        _todo_fields = [
+            k for k, v in defaults.items()
+            if (isinstance(v, str) and v.startswith("TODO_set_"))
+            or (isinstance(v, list) and any(isinstance(x, str) and x.startswith("TODO_set_") for x in v))
+        ]
+        _note = (
+            f"Macro {macro_basename!r} routed to stock registry "
+            f"component `{component_id}` with sensible defaults. "
+            "Tweak the emitted defs.yaml if your usage differs."
+        )
+        if _todo_fields:
+            _note += (
+                f" REQUIRED before materialization: replace `TODO_set_*` "
+                f"placeholders in field(s) {_todo_fields} with the actual "
+                "column names from your upstream DataFrame. (Schema check "
+                "passes either way — the failure surfaces at runtime when "
+                "the component looks up the placeholder column name.)"
+            )
         return MappedTool(
             component_id=str(component_id),
             asset_name=_asset_name_for(node),
             attributes=defaults,
-            notes=[
-                f"Macro {macro_basename!r} routed to stock registry "
-                f"component `{component_id}` with sensible defaults. "
-                "Tweak the emitted defs.yaml if your usage differs."
-            ],
+            notes=[_note],
         )
     return UnmappedTool(
         reason=(

@@ -106,6 +106,14 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "count_regression": "CountRegressionComponent",
     "gamma_regression": "GammaRegressionComponent",
     "weighted_average": "WeightedAverageComponent",
+    # Predictive — clustering / market basket / model comparison.
+    # Registered so the Alteryx stock-macro dispatcher (K-Centroids,
+    # MB_Rules, Model Comparison, etc.) can emit the right `type:` ref.
+    "k_means_clustering": "KMeansClusteringComponent",
+    "append_cluster": "AppendClusterComponent",
+    "market_basket_rules": "MarketBasketRulesComponent",
+    "model_comparison": "ModelComparisonComponent",
+    "create_samples": "CreateSamplesComponent",
 }
 
 

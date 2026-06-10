@@ -882,10 +882,24 @@ def _t_replace_char(args: List[str]):
     )
 
 
+def _raw_str(token: str) -> str:
+    r"""Promote a quoted Python string literal to raw-string form.
+
+    Regex patterns from Alteryx (\d, \w, \s) become Python
+    SyntaxWarnings when emitted as plain string literals. Prefix with
+    `r` so the backslashes are treated literally. Non-literal args
+    (column refs, expressions) pass through unchanged.
+    """
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+        if not token.lower().startswith("r"):
+            return "r" + token
+    return token
+
+
 @register("Regex_Replace")
 def _t_regex_replace(args: List[str]):
     s, pattern, repl = args[0], args[1], args[2]
-    return f"{s}.str.replace({pattern}, {repl}, regex=True)", True, []
+    return f"{s}.str.replace({_raw_str(pattern)}, {repl}, regex=True)", True, []
 
 
 @register("REGEX_Replace")
@@ -896,13 +910,13 @@ def _t_regex_replace_alt(args: List[str]):
 @register("Regex_Match")
 def _t_regex_match(args: List[str]):
     s, pattern = args[0], args[1]
-    return f"{s}.str.match({pattern})", True, []
+    return f"{s}.str.match({_raw_str(pattern)})", True, []
 
 
 @register("Regex_CountMatches")
 def _t_regex_count(args: List[str]):
     s, pattern = args[0], args[1]
-    return f"{s}.str.count({pattern})", True, []
+    return f"{s}.str.count({_raw_str(pattern)})", True, []
 
 
 @register("FindString")
