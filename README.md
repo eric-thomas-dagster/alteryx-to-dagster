@@ -124,7 +124,7 @@ Continuously tested against **138 real Alteryx workflows** drawn from:
 
 Current stats:
 
-- Real-compute mapping rate: **~99%** (1372 / 1386 non-control-flow tools across the corpus)
+- Real-compute mapping rate: **~99.8%** (1998 / 2003 non-control-flow tools across the corpus, and 100% on every workflow re-imported with the current dispatcher — the corpus-wide 5-tool gap is in saved reports that pre-date the latest control-flow classifier fixes; re-importing those workflows clears them).
 - Static validation pass: **100%** (every emitted defs.yaml loads under `dg check`)
 - Materialization rate (with auto-stubbed inputs): **~66%** and rising; remaining failures are split between Alteryx-internal workflow quirks (a few tools reference output cols before they're created) and stub-data dtype mismatches that don't bite real production data.
 

@@ -4557,6 +4557,16 @@ _CONTROL_FLOW_PLUGINS = {
         "Message tool — used for in-flow logging. Drop or replace with "
         "context.log.info() calls in adjacent Python assets if needed."
     ),
+    "AlteryxBasePluginsGui.Message.Message": (
+        "Message tool — Alteryx App message logger. No data flow; drop "
+        "(or wire a context.log.info() in an adjacent asset if needed)."
+    ),
+    "AlteryxGuiToolkit.Condition.Condition": (
+        "Condition — Alteryx App interface control that routes app flow "
+        "based on a runtime predicate. No data flow at compute time; "
+        "drop (use Dagster Config + Python branching in an asset if you "
+        "need analogous runtime behavior)."
+    ),
     "AlteryxBasePluginsGui.Browse.Browse": (
         "Browse tool — Alteryx-specific data preview. Dagster's UI shows "
         "asset previews in materialization metadata automatically; "

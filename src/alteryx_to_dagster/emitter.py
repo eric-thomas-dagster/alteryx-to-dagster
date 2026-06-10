@@ -235,6 +235,22 @@ def emit_migration_report(
         # Macros referenced by relative path outside the bundle — not really
         # unmapped, we just can't find the .yxmc on disk
         "couldn't be inlined", "file not found alongside",
+        # Bundled-file inventory notes (.yxdb data / .yxmc nested macros
+        # inside the .yxzp). These aren't unmapped tools — they're
+        # supplementary inventory the importer surfaces so the user
+        # knows what's in the bundle.
+        "bundled custom macro", "bundled .yxdb data file",
+        "bundled .yxmc", "bundled .yxdb",
+        # Visual report tools that surface their gap with a phrase the
+        # earlier "html report" / "visual concern" entries don't catch.
+        "no runtime data semantic",
+        # Message / Error / app-routing tools — listed as control-flow
+        # in mapper._CONTROL_FLOW_PLUGINS but the reason text uses
+        # phrases that need explicit matching here.
+        "runtime notification", "dagster's logger", "dagster+ alerting",
+        "fails the workflow on a condition", "assetcheck",
+        # Spatial map / chart tools that route to notebook assets.
+        "plotly / folium", "in a notebook asset",
     )
     control_flow: List[tuple] = []
     real_unmapped: List[tuple] = []
