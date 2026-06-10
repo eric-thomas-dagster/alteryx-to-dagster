@@ -20,7 +20,7 @@ from .emitter import emit_inline_python, emit_migration_report, emit_yaml
 from .indb_collapse import build_warehouse_pipelines
 from .macro_splicer import splice_macros
 from .mapper import MappedTool, UnmappedTool, _stock_macro_basenames, map_tool
-from .parser import AlteryxNode, AlteryxWorkflow, parse_workflow
+from .parser import AlteryxEdge, AlteryxNode, AlteryxWorkflow, parse_workflow
 
 
 SCHEMA_URL_BASE = (
@@ -461,6 +461,57 @@ def import_workflow(
             wf.upstreams_of(node.tool_id),
             key=lambda e: (_anchor_sort_key(e), e.origin_tool),
         )
+        # Rewire Filter's `.False` anchor for cascading-router patterns.
+        # Alteryx Filter has two output anchors (True / False); chains
+        # like `51.True → 37 (drivers); 37.False → 36 (bodies_karts);
+        # 36.False → 38 (tires); …` route each row to exactly one of the
+        # downstream Selects via the un-matched branch. Our `filter`
+        # component only emits the TRUE rows, so the `.False` downstream
+        # gets the wrong dataframe. Rewire each `<filter>.False → X.Input`
+        # edge to instead read from `<filter>`'s OWN INPUT — X then
+        # applies its own filter condition on the full source, producing
+        # the same effective per-row routing without needing a multi-
+        # output anchor.
+        _by_id = wf.by_id()
+        def _maybe_rewire_false_cascade(e):
+            # Walk UP through every consecutive Filter `.False` link until
+            # we hit either a non-Filter upstream or a non-`.False` anchor.
+            # This collapses a long cascade `51.True → 37.F → 36.F → 38.F
+            # → 39 (gliders)` so each cascaded filter reads from the ORIGINAL
+            # source (51) — they then apply their own conditions on the full
+            # slice, matching what Alteryx's per-row routing does
+            # semantically without the multi-anchor TRUE/FALSE outputs.
+            origin_tool = e.origin_tool
+            origin_anchor = e.origin_anchor
+            seen: set = set()
+            while True:
+                up_node = _by_id.get(origin_tool)
+                if up_node is None or "Filter" not in (up_node.plugin or ""):
+                    break
+                if origin_anchor not in ("False", "F"):
+                    break
+                if origin_tool in seen:  # cycle guard
+                    break
+                seen.add(origin_tool)
+                parent_in = next(
+                    (pe for pe in wf.upstreams_of(origin_tool)
+                     if pe.dest_anchor in ("Input", "")),
+                    None,
+                )
+                if parent_in is None:
+                    break
+                origin_tool = parent_in.origin_tool
+                origin_anchor = parent_in.origin_anchor
+            if (origin_tool, origin_anchor) == (e.origin_tool, e.origin_anchor):
+                return e
+            return AlteryxEdge(
+                origin_tool=origin_tool,
+                origin_anchor=origin_anchor,
+                dest_tool=e.dest_tool,
+                dest_anchor=e.dest_anchor,
+            )
+        incoming_edges = [_maybe_rewire_false_cascade(e) for e in incoming_edges]
+
         upstreams: List[str] = []
         for e in incoming_edges:
             up = tool_to_asset.get(e.origin_tool, "")
@@ -495,7 +546,13 @@ def import_workflow(
         ):
             attrs = result.attributes
             attrs.setdefault("partition_type", "static")
-            attrs.setdefault("partition_values", list(node.batch_macro_control_values))
+            # Components expect partition_values as a comma-separated
+            # string (Optional[str] on the model, parsed back into a list
+            # at runtime). Don't emit a Python list — pydantic rejects.
+            attrs.setdefault(
+                "partition_values",
+                ",".join(node.batch_macro_control_values),
+            )
             # Filter substitution: if this filter's condition is
             # `df['<control_field>'] == '<value>'` where value is in the
             # control_values list, replace with context.partition_key.
