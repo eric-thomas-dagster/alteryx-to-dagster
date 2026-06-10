@@ -114,6 +114,9 @@ _COMPONENT_CLASS_NAMES: Dict[str, str] = {
     "market_basket_rules": "MarketBasketRulesComponent",
     "model_comparison": "ModelComparisonComponent",
     "create_samples": "CreateSamplesComponent",
+    # Sinks — used by the Alteryx DataStreamIn → warehouse staging table
+    # mapping (and other DataFrame-to-warehouse routes).
+    "dataframe_to_table": "DataframeToTableComponent",
 }
 
 

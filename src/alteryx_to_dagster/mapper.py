@@ -1141,6 +1141,51 @@ def _map_indb_streamout(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
         extra_notes=["StreamOut: this is the boundary where data leaves the warehouse and lands in a pandas DataFrame. Downstream non-In-DB tools consume that DataFrame."])
 
 
+def _map_data_stream_in(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
+    """Alteryx Data Stream In → `dataframe_to_table` sink.
+
+    Inverse of StreamOut: takes an upstream pandas DataFrame (from a
+    non-InDB transform chain) and uploads it to a warehouse table so
+    downstream InDB tools can join / filter / aggregate against it.
+
+    Alteryx writes to a temp / user-named table; we emit
+    `dataframe_to_table` writing to `<asset_name>_stage` by default —
+    downstream InDB tools then `SELECT * FROM <asset_name>_stage` in
+    their CTE chain (indb_collapse recognizes the staging asset as a
+    warehouse source).
+
+    The connection is resolved the same way as InDB tools — slugified
+    from <Connection> → env var (e.g. `SNOWFLAKE_PROD_URL`).
+    """
+    cfg = node.config
+    # Alteryx stores the destination table under TableName / Destination /
+    # OutputTable depending on tool version. Fallback to a derived name.
+    table_el = _find_first(cfg, "TableName", "Destination", "OutputTable", "Table")
+    if table_el is not None and table_el.text:
+        dest_table = table_el.text.strip()
+    else:
+        dest_table = f"{_asset_name_for(node)}_stage"
+
+    return MappedTool(
+        component_id="dataframe_to_table",
+        asset_name=_asset_name_for(node),
+        attributes={
+            "upstream_asset_key": _single_upstream(upstreams),
+            "table": dest_table,
+            "database_url_env_var": _indb_connection_env_var(node),
+            "if_exists": "replace",
+            "group_name": "alteryx_imported_indb",
+        },
+        notes=[
+            f"Data Stream In on tool {node.tool_id}: upstream pandas "
+            f"DataFrame is uploaded to warehouse table `{dest_table}` via "
+            "`dataframe_to_table`. Downstream In-DB tools reference this "
+            "table as a warehouse source — indb_collapse handles the CTE "
+            "wiring automatically."
+        ],
+    )
+
+
 def _map_indb_writedata(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """In-DB Write Data → CTAS into a final user-specified table."""
     cfg = node.config
@@ -3404,6 +3449,71 @@ def _translate_mrf_expression(expr: str, group_cols: List[str]) -> str:
 _PURE_ROW_REF_RE = re.compile(r"^\s*\[Row([+\-])(\d+):([^\]]+)\]\s*$")
 
 
+def _detect_forward_fill(raw_expr: str, out_col: str) -> Optional[str]:
+    r"""Detect the classic Alteryx forward-fill pattern and return the
+    target column to apply pandas `.ffill()` to.
+
+    Both Alteryx idioms below mean "if X is null, use the previous row's
+    X, else keep X" — which in pandas is just `df['X'].ffill()`. The
+    naive `np.where(isna, shift(1), X)` translation is silently WRONG
+    for consecutive nulls (shift returns the original null, not the
+    forward-filled value), so detecting + rewriting matters.
+
+      IF IsNull([X]) THEN [Row-1:X] ELSE [X] ENDIF
+      IIF(IsNull([X]), [Row-1:X], [X])
+
+    Returns the column name `X` if matched, else None. The caller emits
+    `formula` with `expressions: {out_col: df['X'].ffill()}`.
+    """
+    # Strip whitespace + collapse internal whitespace for simpler matching.
+    s = re.sub(r"\s+", " ", raw_expr.strip())
+    patterns = [
+        # IF IsNull([X]) THEN [Row-1:X] ELSE [X] ENDIF — case-insensitive
+        # since real workflows mix "IsNull" / "isnull" / "ISNULL".
+        re.compile(
+            r"^IF\s+(?:IsNull|isnull)\s*\(\s*\[([^\]]+)\]\s*\)\s+"
+            r"THEN\s+\[Row-1:\1\]\s+"
+            r"ELSE\s+\[\1\]\s+ENDIF$",
+            flags=re.IGNORECASE,
+        ),
+        # IIF(IsNull([X]), [Row-1:X], [X])
+        re.compile(
+            r"^IIF\s*\(\s*(?:IsNull|isnull)\s*\(\s*\[([^\]]+)\]\s*\)\s*,\s*"
+            r"\[Row-1:\1\]\s*,\s*"
+            r"\[\1\]\s*\)$",
+            flags=re.IGNORECASE,
+        ),
+    ]
+    for pat in patterns:
+        m = pat.match(s)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _has_self_reference(raw_expr: str, out_col: str) -> bool:
+    """True if the expression references `[Row±N:out_col]` — i.e. depends
+    on the previously-COMPUTED value of the output column.
+
+    Pandas `.shift(N)` returns the ORIGINAL previous value, not the
+    computed one from the prior row. Alteryx evaluates row-by-row so
+    its semantics are iterative — when the user writes
+    `IIF(IsNull([Year]), [Row-1:Year] + 1, [Year])` and Year is null
+    for 3 consecutive rows, Alteryx fills with prev+1, prev+2, prev+3.
+    Pandas only fills with the original null.
+
+    Detection is conservative — we only flag when the output column is
+    actually referenced in a row-shift; the caller emits a translation
+    AND attaches a warning note so the user knows to validate / replace
+    with a Python loop if needed.
+    """
+    for m in _ROW_REF_RE.finditer(raw_expr):
+        ref_col = m.group(3).strip()
+        if ref_col == out_col:
+            return True
+    return False
+
+
 def _map_multi_row_formula(node: AlteryxNode, upstreams: List[str]) -> MappedTool:
     """Alteryx MultiRowFormula → window_calculation when the expression is a
     pure [Row±N:Col] reference, else formula component with a translated
@@ -3446,6 +3556,41 @@ def _map_multi_row_formula(node: AlteryxNode, upstreams: List[str]) -> MappedToo
                 "group_name": "alteryx_imported",
             },
             notes=[f"MultiRowFormula on tool {node.tool_id}: no output column or expression — emitted empty."],
+        )
+
+    # `[_CurrentField_]` is an Alteryx pseudo-token meaning "the column
+    # being updated" (only present when UpdateField=True). Translating
+    # it literally yields `df['_CurrentField_']` which fails at runtime.
+    # Substitute with the actual output column before the rest of the
+    # pipeline sees it.
+    if "[_CurrentField_]" in raw_expr and is_update and out_col:
+        raw_expr = raw_expr.replace("[_CurrentField_]", f"[{out_col}]")
+
+    # Forward-fill shortcut: detect the canonical
+    # `IF IsNull([X]) THEN [Row-1:X] ELSE [X] ENDIF` / IIF form and emit
+    # `df['X'].ffill()` — semantically correct for consecutive nulls,
+    # which the naive np.where+shift translation gets wrong.
+    ff_col = _detect_forward_fill(raw_expr, out_col)
+    if ff_col:
+        ff_expr = (
+            f"df.groupby({group_cols!r}, dropna=False)[{ff_col!r}].ffill()"
+            if group_cols
+            else f"df[{ff_col!r}].ffill()"
+        )
+        return MappedTool(
+            component_id="formula",
+            asset_name=_asset_name_for(node),
+            attributes={
+                "upstream_asset_key": _single_upstream(upstreams),
+                "expressions": {out_col: ff_expr},
+                "group_name": "alteryx_imported",
+            },
+            notes=[
+                f"MultiRowFormula on tool {node.tool_id}: detected forward-fill "
+                f"pattern (IF IsNull THEN [Row-1:X] ELSE [X]) — emitted "
+                f"`{ff_col}.ffill()` which correctly handles consecutive "
+                "nulls (unlike the naive shift(1)+np.where translation)."
+            ],
         )
 
     # Pure single-token [Row±N:Col]? Map to window_calculation.lag/lead.
@@ -3504,6 +3649,23 @@ def _map_multi_row_formula(node: AlteryxNode, upstreams: List[str]) -> MappedToo
         translated,
     )
 
+    _notes = [
+        f"MultiRowFormula on tool {node.tool_id}: compound expression — translated "
+        f"IF/THEN/ELSE + [Row±N:Col] to np.where + df['Col'].shift(N)"
+        + (f" grouped by {group_cols}" if group_cols else "")
+        + "."
+    ]
+    if _has_self_reference(raw_expr, out_col):
+        _notes.append(
+            f"WARNING: expression references [Row±N:{out_col}] — the OUTPUT "
+            "column itself. Alteryx evaluates row-by-row so the reference "
+            "sees the COMPUTED value from the prior row; pandas `.shift(N)` "
+            "returns the ORIGINAL value. For consecutive computations the "
+            "result will diverge. If you need true iterative semantics (e.g. "
+            "cumulative state, gap-fill with increment), replace this "
+            "emitted formula with an inline `@dg.asset` that loops row-by-row "
+            "or uses `.cumsum()` / `.cummax()` / a custom accumulator."
+        )
     return MappedTool(
         component_id="formula",
         asset_name=_asset_name_for(node),
@@ -3512,12 +3674,7 @@ def _map_multi_row_formula(node: AlteryxNode, upstreams: List[str]) -> MappedToo
             "expressions": {out_col: translated},
             "group_name": "alteryx_imported",
         },
-        notes=[
-            f"MultiRowFormula on tool {node.tool_id}: compound expression — translated "
-            f"IF/THEN/ELSE + [Row±N:Col] to np.where + df['Col'].shift(N)"
-            + (f" grouped by {group_cols}" if group_cols else "")
-            + "."
-        ],
+        notes=_notes,
     )
 
 
@@ -4274,6 +4431,10 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
     "AlteryxConnectorsGui.InDbSample.InDbSample": _map_indb_sample,
     "AlteryxConnectorsGui.InDbStreamOut.InDbStreamOut": _map_indb_streamout,
     "AlteryxConnectorsGui.InDbWriteData.InDbWriteData": _map_indb_writedata,
+    # Data Stream In — pandas DataFrame → warehouse staging table
+    # (inverse of StreamOut). Plugin namespace varies; cover both forms.
+    "AlteryxConnectorsGui.DataStreamIn.DataStreamIn": _map_data_stream_in,
+    "AlteryxConnectorsGui.InDb.DataStreamIn": _map_data_stream_in,
     # Some versions use a different namespace prefix.
     "AlteryxConnectorsGui.InDb.InDbInput": _map_indb_input,
     "AlteryxConnectorsGui.InDb.InDbFilter": _map_indb_filter,
@@ -4283,9 +4444,11 @@ PLUGIN_REGISTRY: Dict[str, ToolMapping] = {
 # Fuzzier match for In-DB tools whose plugin id varies across Alteryx versions
 # (the canonical match goes through PLUGIN_REGISTRY first; this is a fallback).
 def _fuzzy_indb_match(plugin: str) -> Optional[ToolMapping]:
-    if "indb" not in plugin.lower():
-        return None
     name = plugin.lower()
+    if "indb" not in name and "datastreamin" not in name:
+        return None
+    if "datastreamin" in name:
+        return _map_data_stream_in
     if "connectionmanager" in name or "indbconnect" in name:
         return _map_indb_connect
     if "input" in name:

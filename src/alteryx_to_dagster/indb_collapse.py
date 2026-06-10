@@ -36,6 +36,16 @@ _CONNECTION_PLUGINS = {
 }
 _SINK_PLUGINS = _STREAM_OUT_PLUGINS | _WRITE_DATA_PLUGINS
 
+# Data Stream In feeds a pandas DataFrame INTO the warehouse so downstream
+# In-DB tools can use it. We keep DataStreamIn OUTSIDE the in-db subgraph
+# (it emits as a separate `dataframe_to_table` sink), but when an in-db
+# subgraph's first step has a DataStreamIn as external upstream, we wire
+# the step's source to read the staging table the DataStreamIn wrote to.
+_DATA_STREAM_IN_PLUGINS = {
+    "AlteryxConnectorsGui.DataStreamIn.DataStreamIn",
+    "AlteryxConnectorsGui.InDb.DataStreamIn",
+}
+
 
 def _is_indb(node: AlteryxNode) -> bool:
     return (
@@ -300,6 +310,44 @@ def _node_dialect_hint(node: AlteryxNode) -> str:
     return "snowflake"
 
 
+def _data_stream_in_table(node: AlteryxNode) -> str:
+    """Resolve the warehouse staging table a DataStreamIn writes to.
+    Mirrors the logic in mapper._map_data_stream_in so the in-db chain
+    can FROM the right table."""
+    cfg = node.config
+    for tag in ("TableName", "Destination", "OutputTable", "Table"):
+        el = cfg.find(tag)
+        if el is not None and el.text and el.text.strip():
+            return el.text.strip()
+    # Fallback: same default the mapper uses.
+    anno = node.annotation or ""
+    base = (
+        "".join(c if c.isalnum() else "_" for c in anno.lower()).strip("_")
+        or f"datastreamin_{node.tool_id}"
+    )
+    return f"{base}_stage"
+
+
+def _datastreamin_upstreams(group: Set[str], wf: AlteryxWorkflow) -> Dict[str, str]:
+    """Map each in-group tool_id → DataStreamIn tool_id when its external
+    upstream is a DataStreamIn. Used to wire the first step's source to
+    the staging table the DataStreamIn wrote.
+    """
+    by_id = wf.by_id()
+    result: Dict[str, str] = {}
+    for tid in group:
+        for e in wf.upstreams_of(tid):
+            if e.origin_tool in group:
+                continue
+            up_node = by_id.get(e.origin_tool)
+            if up_node is None:
+                continue
+            if up_node.plugin in _DATA_STREAM_IN_PLUGINS:
+                result[tid] = e.origin_tool
+                break
+    return result
+
+
 def build_warehouse_pipelines(wf: AlteryxWorkflow) -> List[Dict]:
     """Detect each multi-tool In-DB subgraph and return a list of
     warehouse_pipeline asset definitions, one per group.
@@ -325,6 +373,7 @@ def build_warehouse_pipelines(wf: AlteryxWorkflow) -> List[Dict]:
 
     for idx, group in enumerate(groups):
         ordered_ids = _topo_within(group, wf)
+        ds_in_map = _datastreamin_upstreams(group, wf)  # tool_id → DataStreamIn tool_id
         # Build steps and sinks
         steps: List[Dict] = []
         sinks: List[Dict] = []
@@ -347,6 +396,20 @@ def build_warehouse_pipelines(wf: AlteryxWorkflow) -> List[Dict]:
                 continue
             step = _node_to_step(node, upstream_step_map[tid])
             if step is not None:
+                # When this step has no in-group upstream and the EXTERNAL
+                # upstream is a DataStreamIn, rewrite the source to point
+                # at the staging table the DataStreamIn wrote to.
+                _existing_src = step.get("source") or {}
+                if (
+                    not upstream_step_map[tid]
+                    and tid in ds_in_map
+                    and _existing_src.get("kind") != "table"
+                ):
+                    ds_node = by_id[ds_in_map[tid]]
+                    step["source"] = {
+                        "kind": "table",
+                        "table": _data_stream_in_table(ds_node),
+                    }
                 steps.append(step)
 
         # Second pass: emit sinks.
@@ -393,11 +456,15 @@ def build_warehouse_pipelines(wf: AlteryxWorkflow) -> List[Dict]:
             "sinks": sinks,
             "group_name": "alteryx_imported_indb",
         }
+        # DataStreamIn nodes feeding this group are external upstreams —
+        # the runner uses these to wire the warehouse_pipeline asset's
+        # `upstream_asset_keys` so the staging upload runs first.
+        external_upstreams = sorted(set(ds_in_map.values()))
         pipelines.append({
             "asset_name": asset_name,
             "tool_ids": group,
             "attrs": attrs,
-            "upstream_tool_ids": [],  # In-DB groups don't take external upstreams in current corpus
+            "upstream_tool_ids": external_upstreams,
             "downstream_consumers": downstream_consumers,
         })
 

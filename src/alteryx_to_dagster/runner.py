@@ -288,30 +288,17 @@ def import_workflow(
     files_written: List[Path] = []
 
     # Collapse connected In-DB subgraphs into a single warehouse_pipeline asset
-    # per group BEFORE the per-tool loop, so each In-DB tool maps to the
-    # collapsed asset_name instead of its own sql_transform CTAS.
+    # per group. Subgraph detection runs BEFORE the per-tool loop so each
+    # In-DB tool's tool_to_asset maps to the collapsed asset_name instead
+    # of its own sql_transform CTAS. The actual YAML emit is DEFERRED until
+    # after the per-tool loop so we can wire deps on external upstreams
+    # (e.g. DataStreamIn assets) that are only mapped during the main loop.
     _indb_groups = build_warehouse_pipelines(wf)
     _collapsed_tool_ids: set = set()
     for _grp in _indb_groups:
         _collapsed_tool_ids |= _grp["tool_ids"]
-        _path = emit_yaml(
-            out_root=out_dir,
-            pkg=pkg,
-            component_id="warehouse_pipeline",
-            asset_name=_grp["asset_name"],
-            attributes=_grp["attrs"],
-        )
-        files_written.append(_path)
-        component_ids_used.append("warehouse_pipeline")
         for _tid in _grp["tool_ids"]:
             tool_to_asset[_tid] = _grp["asset_name"]
-        mapped_results.append((
-            ",".join(sorted(_grp["tool_ids"])),
-            "AlteryxConnectorsGui.InDb*",
-            "warehouse_pipeline",
-            _grp["asset_name"],
-            [f"Collapsed {len(_grp['tool_ids'])} In-DB tools into one CTE-chain asset."],
-        ))
 
     placeholder_assets_emitted: set = set()  # tool_ids we've stubbed a source for
 
@@ -485,6 +472,40 @@ def import_workflow(
             result.component_id,
             result.asset_name,
             result.notes,
+        ))
+
+    # Deferred warehouse_pipeline emit — runs AFTER the per-tool loop so
+    # we can resolve external upstreams (e.g. DataStreamIn tools) to
+    # their emitted asset names via tool_to_asset, then wire them as
+    # `deps` on the warehouse_pipeline asset.
+    for _grp in _indb_groups:
+        _attrs = dict(_grp["attrs"])
+        _ext_ups = _grp.get("upstream_tool_ids") or []
+        _dep_assets = [tool_to_asset[t] for t in _ext_ups if t in tool_to_asset]
+        if _dep_assets:
+            _attrs["deps"] = _dep_assets
+        _path = emit_yaml(
+            out_root=out_dir,
+            pkg=pkg,
+            component_id="warehouse_pipeline",
+            asset_name=_grp["asset_name"],
+            attributes=_attrs,
+        )
+        files_written.append(_path)
+        component_ids_used.append("warehouse_pipeline")
+        _note = f"Collapsed {len(_grp['tool_ids'])} In-DB tools into one CTE-chain asset."
+        if _dep_assets:
+            _note += (
+                f" External upstreams (Data Stream In, etc.) wired via "
+                f"deps={_dep_assets}; the first step reads from the "
+                "warehouse staging table they uploaded to."
+            )
+        mapped_results.append((
+            ",".join(sorted(_grp["tool_ids"])),
+            "AlteryxConnectorsGui.InDb*",
+            "warehouse_pipeline",
+            _grp["asset_name"],
+            [_note],
         ))
 
     # Surface bundled files (only present when the source was .yxzp / .yxmz).
