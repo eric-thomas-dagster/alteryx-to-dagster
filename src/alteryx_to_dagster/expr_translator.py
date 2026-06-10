@@ -76,12 +76,58 @@ def register(name: str):
 
 # ---------------------------------------------------------------- public
 
+# Match a single quoted string with NO operators / quotes inside, so we
+# don't re-rewrite already-templated expressions like `"" + ""`.
+_BARE_STRING_LITERAL_RE = re.compile(r'^\s*(["\'])([^"\'+\-*/]*)\1\s*$', re.DOTALL)
+_BARE_NUMERIC_LITERAL_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*$")
+
+
+def _wrap_dagster_safe_literal(expr: str) -> Optional[str]:
+    r"""Rewrite a bare string or numeric literal into a templating-safe form.
+
+    Dagster Components' Resolvable templating treats simple quoted
+    scalars in defs.yaml as YAML scalars and strips them — `'""'` (the
+    2-char string `""`) becomes `''` (empty) by the time the component
+    receives it. Same trap for `'42'` → `42` (int). When the formula
+    importer wants `[Blank] = ""` (broadcast an empty string), the
+    emitted expression `""` survives YAML loading but doesn't survive
+    Dagster's templating, so pandas-eval gets `''` and raises
+    `ValueError: expr cannot be an empty string`.
+
+    Workaround: rewrite bare literals into expressions whose form
+    survives templating but evaluates to the same value:
+        ""      → '"" + ""'        (pandas-eval friendly string concat)
+        "hello" → '"hello" + ""'
+        42      → '(42 + 0)'
+
+    Returns the rewritten expression, or None when no rewrite is needed.
+    """
+    sm = _BARE_STRING_LITERAL_RE.match(expr)
+    if sm:
+        q, body = sm.group(1), sm.group(2)
+        return f'{q}{body}{q} + {q}{q}'
+    if _BARE_NUMERIC_LITERAL_RE.match(expr):
+        return f"({expr.strip()} + 0)"
+    return None
+
+
 def translate(alteryx_expr: str) -> ExprTranslation:
     """Translate an Alteryx formula expression to a pandas-compatible
     expression. Returns ExprTranslation with `fully=True` when every
     token translated deterministically."""
     expr = alteryx_expr.strip()
     notes: List[str] = []
+
+    # Bare-literal short-circuit: rewrite into a templating-safe form so
+    # Dagster's Resolvable layer doesn't strip the literal to empty/int.
+    _safe = _wrap_dagster_safe_literal(expr)
+    if _safe is not None:
+        return ExprTranslation(
+            pandas_expr=_safe,
+            is_python=False,
+            fully=True,
+            notes=[],
+        )
 
     # Pre-pass: Alteryx allows `=` as an equality operator (in addition to
     # `==`). pandas eval and Python both need `==`, so promote any bare `=`

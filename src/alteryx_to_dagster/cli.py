@@ -242,9 +242,13 @@ def _ensure_runtime_deps(out_dir: Path) -> None:
             err=True,
         )
         return
-    click.echo("  Adding pandas, numpy, dagster-webserver, dagster-dg-cli ...")
+    click.echo("  Adding pandas, numpy, openpyxl, dagster-webserver, dagster-dg-cli ...")
+    # openpyxl is a transitive runtime dep of any workflow that reads/writes
+    # .xlsx (Alteryx Excel Input → dataframe_from_excel, etc.). pandas itself
+    # doesn't bundle it, and `dagster-component add` doesn't propagate
+    # component requirements.txt, so we add it here unconditionally.
     subprocess.run(
-        [uv, "add", "pandas", "numpy"],
+        [uv, "add", "pandas", "numpy", "openpyxl"],
         cwd=out_dir, capture_output=True, text=True,
     )
     subprocess.run(
