@@ -14,7 +14,48 @@ import yaml
 from pathlib import Path
 
 AUDIT_ROOT = Path("/tmp/wc_audit")
-COMBINED_DEFS = Path("/tmp/wc_combined/src/wc_combined/defs")
+COMBINED_ROOT = Path("/tmp/wc_combined")
+COMBINED_DEFS = COMBINED_ROOT / "src" / "wc_combined" / "defs"
+COMBINED_COMPONENTS = COMBINED_ROOT / "src" / "wc_combined" / "components"
+TEMPLATES_ROOT = Path(
+    "/Users/ericthomas/dagster_components/dagster-component-templates "
+)
+
+
+def overlay_local_templates() -> int:
+    """Copy local component.py edits over installed registry components.
+
+    `dagster-component add --auto-install` pulls components from the
+    published `dagster-community-components` package. Local template
+    edits don't propagate until republished. Overlay step lets us
+    iterate on component code without bumping the package version.
+    """
+    if not COMBINED_COMPONENTS.is_dir() or not TEMPLATES_ROOT.is_dir():
+        return 0
+    overlaid = 0
+    # Find each installed component dir's matching template.
+    for installed in sorted(COMBINED_COMPONENTS.iterdir()):
+        if not installed.is_dir():
+            continue
+        cid = installed.name
+        # Search the templates tree for a sibling dir of the same name.
+        matches = list(TEMPLATES_ROOT.rglob(f"{cid}/component.py"))
+        # Filter out demo/test/install copies; prefer the canonical template.
+        candidates = [
+            m for m in matches
+            if "/.venv/" not in str(m)
+            and "/demo" not in str(m)
+            and "/tests/" not in str(m)
+            and "/__pycache__/" not in str(m)
+        ]
+        if not candidates:
+            continue
+        src = candidates[0]
+        dst = installed / "component.py"
+        if src.read_text() != (dst.read_text() if dst.exists() else ""):
+            dst.write_text(src.read_text())
+            overlaid += 1
+    return overlaid
 
 
 def rewrite_type(t: str) -> str:
@@ -32,6 +73,70 @@ def prefix_key(key: str, wf: str) -> str:
     if not key or "/" in key:
         return key  # already hierarchical
     return f"{wf}/{key}"
+
+
+def normalize_column_lists(data: dict) -> dict:
+    """Stringify non-str non-int values in any list-typed attribute.
+
+    Importer-generated stubs sometimes inherit Alteryx connection labels
+    like `[0, 1]` (the batch-macro iteration tuple), which YAML parses
+    as tuples or lists. Force them to strings so pydantic's
+    Union[str, int] field validators accept them.
+    """
+    attrs = data.get("attributes") or {}
+    def _safe(c):
+        # Preserve dicts/lists (e.g. rules on AutomationConditionApplicator).
+        if isinstance(c, (dict, list)):
+            return c
+        # Force everything else to str.
+        s = c if isinstance(c, str) else str(c)
+        # Dagster's Resolvable templating eval-resolves quoted YAML strings:
+        # "0, 1" gets parsed as a Python tuple expression. Defuse by
+        # replacing the offending comma-space with an underscore.
+        if "," in s:
+            s = s.replace(", ", "_").replace(",", "_")
+        return s
+    for k, v in list(attrs.items()):
+        if isinstance(v, list):
+            attrs[k] = [_safe(c) for c in v]
+    return data
+
+
+def soften_yxdb_missing(data: dict) -> dict:
+    """Default dataframe_from_yxdb to if_missing='empty' for importer demos.
+
+    Imported workflows often hardcode Windows-only paths (e.g.
+    C:\\Users\\Kiran\\Downloads\\...) that the customer can't restore on
+    macOS/Linux. Falling back to an empty DataFrame lets the rest of
+    the chain materialize so the customer can see which transforms are
+    wired up correctly. If they need strict behavior, they can override
+    if_missing='raise' on the asset.
+    """
+    if "dataframe_from_yxdb" not in data.get("type", ""):
+        return data
+    attrs = data.get("attributes") or {}
+    if "if_missing" not in attrs:
+        attrs["if_missing"] = "empty"
+    return data
+
+
+def strip_unsupported_partitions(data: dict) -> dict:
+    """InlineDataframeComponent doesn't support partition_* fields.
+    The importer's batch-macro splicer adds them to every spliced asset
+    including text inputs; strip them from inline-dataframe defs so
+    pydantic doesn't reject the YAML at load time.
+    """
+    if "inline_dataframe" not in data.get("type", ""):
+        return data
+    attrs = data.get("attributes") or {}
+    for k in (
+        "partition_type", "partition_values", "partition_start",
+        "partition_date_column", "dynamic_partition_name",
+        "partition_dimensions", "partition_static_dim",
+        "partition_static_column",
+    ):
+        attrs.pop(k, None)
+    return data
 
 
 def rewrite_attrs(attrs: dict, wf: str) -> dict:
@@ -76,12 +181,12 @@ def main() -> None:
         src_defs = pkg_dirs[0] / "defs"
         if not src_defs.is_dir():
             continue
-        # First pass — scan all YAMLs; skip the WHOLE workflow if any
-        # `columns:` entry parses as int (Dagster's Resolvable templating
-        # coerces YAML-quoted '1'/'6' to int and pydantic then rejects them
-        # against List[str]; pre-filter avoids whole-project load failures).
+        # Collect all YAMLs. The previous version filtered workflows with
+        # numeric-stringable column lists, but inline_dataframe and
+        # text_to_columns now accept Union[str, int], so the filter is
+        # no longer needed for those. Other components may still trip;
+        # surface those failures so we can patch them too.
         wf_yamls: list[tuple[Path, dict]] = []
-        has_numeric_col = False
         for tool_dir in sorted(src_defs.iterdir()):
             if not tool_dir.is_dir():
                 continue
@@ -89,27 +194,7 @@ def main() -> None:
             if not src_yaml.is_file():
                 continue
             data = yaml.safe_load(src_yaml.read_text()) or {}
-            attrs = data.get("attributes") or {}
-            # Dagster's Resolvable templating coerces string '1' to int 1 at
-            # template-resolve time, so a YAML string that looks like a number
-            # trips List[str] validation on ANY str-valued list (columns,
-            # output_columns, group_by, ...). Walk all list attrs to detect.
-            def _is_numeric_col(c) -> bool:
-                if isinstance(c, int):
-                    return True
-                if isinstance(c, str) and c.lstrip("-").isdigit():
-                    return True
-                return False
-            for v in attrs.values():
-                if isinstance(v, list) and any(_is_numeric_col(c) for c in v):
-                    has_numeric_col = True
-                    break
-            if has_numeric_col:
-                break
             wf_yamls.append((tool_dir, data))
-        if has_numeric_col:
-            skipped_wfs.append(wf)
-            continue
         # Collect (produced, referenced) keys to detect missing upstreams.
         produced: set[str] = set()
         referenced: set[str] = set()
@@ -132,6 +217,9 @@ def main() -> None:
         missing_keys = referenced - produced
         for tool_dir, data in wf_yamls:
             data["type"] = rewrite_type(data.get("type", ""))
+            data = normalize_column_lists(data)
+            data = strip_unsupported_partitions(data)
+            data = soften_yxdb_missing(data)
             attrs = data.get("attributes") or {}
             data["attributes"] = rewrite_attrs(attrs, wf)
             out_dir = COMBINED_DEFS / wf / tool_dir.name
@@ -161,6 +249,9 @@ def main() -> None:
         print(f"Skipped {len(skipped_wfs)} workflows with numeric-column refs:")
         for w in skipped_wfs[:10]:
             print(f"  - {w}")
+    overlaid = overlay_local_templates()
+    if overlaid:
+        print(f"Overlaid {overlaid} installed component(s) with local edits.")
     print(f"Combined {n_workflows} workflows, {n_assets} assets → {COMBINED_DEFS}")
 
 
